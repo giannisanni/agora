@@ -33,8 +33,14 @@ One Rust binary on substrate. Stack: rmcp (official Rust MCP SDK, streamable
 HTTP transport) + axum + rusqlite.
 
 - Personal machines: reach it over Tailscale (`http://substrate:<port>/mcp`).
-- Friends: same server exposed via cloudflared + auth (existing
-  `mcp-x.giannisan.com` pattern). Bearer token per user.
+- Friends, door 1 (preferred): Tailscale node sharing — share ONLY substrate
+  from the admin console; friend accepts with their own free account, never
+  joins our tailnet, ACLs gate ports. Front the hub with `tailscale serve` so
+  requests carry identity headers (`Tailscale-User-Login`) — identity for free,
+  no token management. VERIFY during implementation: headers populated for
+  shared-node external users, not just tailnet members.
+- Friends, door 2 (fallback, no Tailscale install): cloudflared + bearer token
+  (existing `mcp-x.giannisan.com` pattern).
 - Storage: single SQLite file. Messages in a rolling window (prune old).
 
 Hub, not P2P: at "me + a few friends" scale, P2P buys nothing and costs
