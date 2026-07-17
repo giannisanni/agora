@@ -6,7 +6,7 @@ use rmcp::{
     model::*,
     tool, tool_handler, tool_router,
     transport::streamable_http_server::{
-        StreamableHttpService, session::local::LocalSessionManager,
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     },
 };
 use rusqlite::Connection;
@@ -268,10 +268,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_path = std::env::var("AGORA_DB").unwrap_or_else(|_| "agora.db".into());
     let db = Arc::new(Db::open(&db_path)?);
 
+    // Host allowlist (rmcp DNS-rebinding guard): bind addr + bare host + localhost,
+    // extend with AGORA_ALLOWED_HOSTS (comma-sep) for MagicDNS names like "substrate:8787".
+    let mut allowed: Vec<String> =
+        vec!["localhost".into(), "127.0.0.1".into(), "::1".into(), addr.clone()];
+    if let Some((host, _)) = addr.rsplit_once(':') {
+        allowed.push(host.to_string());
+    }
+    if let Ok(extra) = std::env::var("AGORA_ALLOWED_HOSTS") {
+        allowed.extend(extra.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+    }
+
     let service = StreamableHttpService::new(
         move || Ok(Agora::new(db.clone())),
         LocalSessionManager::default().into(),
-        Default::default(),
+        StreamableHttpServerConfig::default().with_allowed_hosts(allowed),
     );
     let router = axum::Router::new().nest_service("/mcp", service);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
