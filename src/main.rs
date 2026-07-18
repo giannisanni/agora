@@ -286,6 +286,48 @@ impl Db {
         if n == 0 { Err(AgoraErr::Denied) } else { Ok(()) }
     }
 
+    fn wakeable(&self) -> rusqlite::Result<Vec<serde_json::Value>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT a.id, a.room, a.name, a.machine, unixepoch() - a.last_seen,
+                    (SELECT COUNT(*) FROM messages m
+                      WHERE m.room = a.room AND m.id > a.cursor AND m.sender != a.name
+                        AND m.kind NOT IN ({FEED_KINDS})
+                        AND (m.recipient IS NULL OR m.recipient = a.name))
+             FROM agents a WHERE unixepoch() - a.last_seen > 30",
+        ))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(json!({
+                    "agent_id": r.get::<_, i64>(0)?,
+                    "room": r.get::<_, String>(1)?,
+                    "name": r.get::<_, String>(2)?,
+                    "machine": r.get::<_, Option<String>>(3)?,
+                    "idle_secs": r.get::<_, i64>(4)?,
+                    "unread": r.get::<_, i64>(5)?,
+                }))
+            })?
+            .filter(|r| r.as_ref().map(|v| v["unread"].as_i64().unwrap_or(0) > 0).unwrap_or(true))
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    fn delete_room(&self, room: &str) -> rusqlite::Result<(usize, usize)> {
+        let conn = self.0.lock().unwrap();
+        let m = conn.execute("DELETE FROM messages WHERE room = ?1", [room])?;
+        let a = conn.execute("DELETE FROM agents WHERE room = ?1", [room])?;
+        Ok((a, m))
+    }
+
+    fn kick(&self, room: &str, names: &[String]) -> rusqlite::Result<usize> {
+        let conn = self.0.lock().unwrap();
+        let mut n = 0;
+        for name in names {
+            n += conn.execute("DELETE FROM agents WHERE room = ?1 AND name = ?2", (room, name))?;
+        }
+        Ok(n)
+    }
+
     // observer view for the TUI: recent inbox-class traffic, no cursor effects
     fn recent_messages(&self, room: &str, limit: i64) -> rusqlite::Result<Vec<serde_json::Value>> {
         let conn = self.0.lock().unwrap();
@@ -673,6 +715,53 @@ async fn http_move(
     Ok(axum::Json(json!({ "ok": true })))
 }
 
+#[derive(serde::Deserialize)]
+struct KickReq {
+    room: String,
+    names: Vec<String>,
+}
+
+async fn http_kick(
+    axum::extract::State(db): axum::extract::State<Arc<Db>>,
+    headers: axum::http::HeaderMap,
+    axum::Json(req): axum::Json<KickReq>,
+) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    check_token(&headers)?;
+    let n = db
+        .kick(&req.room, &req.names)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(axum::Json(json!({ "kicked": n })))
+}
+
+// idle agents with unread mail, for the wake shim
+async fn http_wakeable(
+    axum::extract::State(db): axum::extract::State<Arc<Db>>,
+    headers: axum::http::HeaderMap,
+) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    check_token(&headers)?;
+    let list = db
+        .wakeable()
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(axum::Json(json!({ "agents": list })))
+}
+
+#[derive(serde::Deserialize)]
+struct DelRoomReq {
+    room: String,
+}
+
+async fn http_delroom(
+    axum::extract::State(db): axum::extract::State<Arc<Db>>,
+    headers: axum::http::HeaderMap,
+    axum::Json(req): axum::Json<DelRoomReq>,
+) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    check_token(&headers)?;
+    let (agents, messages) = db
+        .delete_room(&req.room)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(axum::Json(json!({ "deleted_agents": agents, "deleted_messages": messages })))
+}
+
 // plain HTTP door for the scribe daemon, gated by a shared secret
 async fn ingest(
     axum::extract::State(db): axum::extract::State<Arc<Db>>,
@@ -724,6 +813,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/messages", axum::routing::get(http_messages))
         .route("/rooms", axum::routing::get(http_rooms))
         .route("/move", axum::routing::post(http_move))
+        .route("/kick", axum::routing::post(http_kick))
+        .route("/delroom", axum::routing::post(http_delroom))
+        .route("/wakeable", axum::routing::get(http_wakeable))
         .with_state(db_state)
         .nest_service("/mcp", service);
     let listener = tokio::net::TcpListener::bind(&addr).await?;

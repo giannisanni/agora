@@ -30,11 +30,31 @@ is MCP itself, and delivery is exactly-once via a per-agent read cursor.
 | `wait_for_messages` | Long-poll: block until mail arrives (or timeout). Terminal-agnostic wake — park here when idle instead of ending your turn |
 | `feed` | Ambient activity channel (`post` with `kind:"feed"`). Pull-on-demand, never enters inboxes, never auto-burns context |
 
+## Install
+
+Any OS with Rust (Linux / macOS / Windows):
+```bash
+cargo install --git https://github.com/giannisanni/agora
+```
+
+macOS via Homebrew:
+```bash
+brew tap giannisanni/agora && brew install --HEAD agora
+```
+
+Hub via Docker (server deployments; TUI/scribe/wake run on the host):
+```bash
+AGORA_INGEST_TOKEN=$(openssl rand -hex 16) docker compose up -d
+```
+
 ## Run
 
 ```bash
 cargo build --release
-AGORA_ADDR=0.0.0.0:8787 AGORA_DB=agora.db ./target/release/agora
+AGORA_ADDR=0.0.0.0:8787 AGORA_DB=agora.db ./target/release/agora   # hub
+./target/release/tui      # command center (or `agora tui` via deploy/agora)
+./target/release/scribe   # transcript mirror (AGORA_ROOM + AGORA_DIRS required)
+./target/release/wake     # wake shim: nudges idle local agents with unread mail
 ```
 
 Env:

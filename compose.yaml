@@ -1,0 +1,11 @@
+services:
+  agora:
+    build: .
+    ports: ["8787:8787"]
+    volumes: ["agora-data:/data"]
+    environment:
+      AGORA_INGEST_TOKEN: ${AGORA_INGEST_TOKEN:?set a token}
+      AGORA_ALLOWED_HOSTS: ${AGORA_ALLOWED_HOSTS:-localhost}
+    restart: unless-stopped
+volumes:
+  agora-data:

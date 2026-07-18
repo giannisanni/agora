@@ -14,7 +14,7 @@ use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEve
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 const COLLAPSE_AT: usize = 5; // bodies longer than this collapse to 4 + hint
 
@@ -25,6 +25,8 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("room", "<name>", "Switch to a room (creates it on first post)"),
     ("move", "<agent> <room>", "Move an agent from this room to another"),
     ("name", "<me>", "Change the name you post as"),
+    ("kick", "<agent> [agent...]", "Remove agent(s) from this room"),
+    ("delroom", "<room>", "Delete a room (all its agents + messages)"),
     ("quit", "", "Exit the TUI"),
 ];
 
@@ -45,6 +47,26 @@ struct App {
     msg_area: Rect,
     suggest_idx: usize,
     quit: bool,
+    rooms: Vec<String>,
+    peer_vis: Vec<(usize, u16, u16)>, // (peer idx, y, h) for clicks
+    peers_area: Rect,
+    peer_menu: Option<usize>,         // open menu for peer idx
+    menu_items: Vec<(Rect, MenuAction)>,
+}
+
+#[derive(Clone, Copy)]
+enum MenuAction {
+    Message,
+    Kick,
+    Move,
+    Close,
+}
+
+struct Suggestion {
+    completed: String, // input becomes this on completion
+    label: String,
+    desc: String,
+    run: bool,         // execute immediately on Enter
 }
 
 fn get(url: &str, token: &str) -> Option<serde_json::Value> {
@@ -151,26 +173,82 @@ impl App {
         }
     }
 
-    /// Commands matching the partial "/xyz" being typed (popup contents).
-    fn suggestions(&self) -> Vec<&'static (&'static str, &'static str, &'static str)> {
-        let Some(rest) = self.input.strip_prefix('/') else { return vec![] };
-        if rest.contains(' ') {
-            return vec![];
+    fn fetch_rooms(&mut self) {
+        if let Some(v) = get(&format!("{}/rooms", self.hub), &self.token) {
+            self.rooms = v["rooms"].as_array().cloned().unwrap_or_default()
+                .iter()
+                .filter_map(|r| r["room"].as_str().map(String::from))
+                .collect();
         }
-        COMMANDS.iter().filter(|(n, _, _)| n.starts_with(rest)).collect()
+    }
+
+    fn peer_names(&self) -> Vec<String> {
+        self.peers.iter().filter_map(|p| p["name"].as_str().map(String::from)).collect()
+    }
+
+    /// Context-aware autocomplete: /commands, @peers, and argument completion
+    /// for /kick /move /room /delroom.
+    fn suggestions(&self) -> Vec<Suggestion> {
+        let input = &self.input;
+        // "/cmd" being typed
+        if let Some(rest) = input.strip_prefix('/') {
+            if !rest.contains(' ') {
+                return COMMANDS.iter().filter(|(n, _, _)| n.starts_with(rest)).map(|(n, args, d)| Suggestion {
+                    completed: if args.is_empty() { format!("/{n}") } else { format!("/{n} ") },
+                    label: format!("/{n} {args}"),
+                    desc: d.to_string(),
+                    run: args.is_empty(),
+                }).collect();
+            }
+            // argument completion: last token against peers or rooms
+            let (cmd, tail) = rest.split_once(' ').unwrap();
+            let last = tail.rsplit(' ').next().unwrap_or("");
+            let prefix_done = &input[..input.len() - last.len()];
+            let candidates: Vec<String> = match cmd {
+                "kick" | "move" if tail.matches(' ').count() == 0 || cmd == "kick" => self.peer_names(),
+                "move" => self.rooms.clone(), // second arg of /move
+                "room" | "delroom" => self.rooms.clone(),
+                _ => vec![],
+            };
+            return candidates.iter()
+                .filter(|c| c.starts_with(last) && !last.is_empty() || last.is_empty())
+                .filter(|c| c.starts_with(last))
+                .map(|c| Suggestion {
+                    completed: format!("{prefix_done}{c} "),
+                    label: c.clone(),
+                    desc: String::new(),
+                    run: false,
+                })
+                .collect();
+        }
+        // "@name" DM completion
+        if let Some(rest) = input.strip_prefix('@') {
+            if !rest.contains(' ') {
+                return self.peer_names().iter()
+                    .filter(|n| n.starts_with(rest))
+                    .map(|n| Suggestion {
+                        completed: format!("@{n} "),
+                        label: format!("@{n}"),
+                        desc: "send a DM".into(),
+                        run: false,
+                    })
+                    .collect();
+            }
+        }
+        vec![]
     }
 
     fn complete_suggestion(&mut self) -> bool {
         let sugg = self.suggestions();
-        let Some(&&(name, args, _)) = sugg.get(self.suggest_idx.min(sugg.len().saturating_sub(1))) else {
+        let Some(s) = sugg.get(self.suggest_idx.min(sugg.len().saturating_sub(1))) else {
             return false;
         };
-        if args.is_empty() {
-            // no-arg command: run immediately
+        if s.run {
+            let cmd = s.completed.trim_start_matches('/').to_string();
             self.input.clear();
-            self.command(name.to_string());
+            self.command(cmd);
         } else {
-            self.input = format!("/{name} ");
+            self.input = s.completed.clone();
         }
         true
     }
@@ -194,6 +272,7 @@ impl App {
             ("room", Some(r), _) => {
                 self.room = r.to_string();
                 self.selected = None;
+                self.fetch_rooms();
                 self.refresh();
                 self.status = format!("switched to room {} ({} msgs)", self.room, self.messages.len());
             }
@@ -212,7 +291,33 @@ impl App {
                 self.status = format!("posting as {}", self.name);
             }
             ("quit", _, _) => self.quit = true,
-            _ => self.status = "commands: /rooms  /room <name>  /move <agent> <room>  /name <me>".into(),
+            ("kick", Some(_), _) => {
+                let names: Vec<String> = cmd.split_whitespace().skip(1).map(String::from).collect();
+                let payload = serde_json::json!({ "room": self.room, "names": names });
+                match ureq::post(&format!("{}/kick", self.hub))
+                    .header("x-agora-token", &self.token)
+                    .send_json(&payload)
+                {
+                    Ok(_) => { self.status = format!("kicked: {}", names.join(", ")); self.refresh(); }
+                    Err(e) => self.status = format!("kick failed: {e}"),
+                }
+            }
+            ("delroom", Some(r), _) => {
+                let payload = serde_json::json!({ "room": r });
+                match ureq::post(&format!("{}/delroom", self.hub))
+                    .header("x-agora-token", &self.token)
+                    .send_json(&payload)
+                {
+                    Ok(_) => {
+                        self.status = format!("deleted room {r}");
+                        if self.room == r { self.room = "dev".into(); }
+                        self.fetch_rooms();
+                        self.refresh();
+                    }
+                    Err(e) => self.status = format!("delroom failed: {e}"),
+                }
+            }
+            _ => self.status = "commands: /rooms /room /move /kick /delroom /name /quit".into(),
         }
     }
 
@@ -293,7 +398,87 @@ impl App {
         out
     }
 
+    fn build_peers(&mut self, area: Rect) -> Vec<Line<'static>> {
+        self.peers_area = area;
+        self.peer_vis.clear();
+        self.menu_items.clear();
+        let mut out: Vec<Line> = Vec::new();
+        let mut y = area.y;
+        for (idx, p) in self.peers.iter().enumerate() {
+            let name = p["name"].as_str().unwrap_or("?").to_string();
+            let harness = p["harness"].as_str().unwrap_or("").to_string();
+            let status = p["status"].as_str().unwrap_or("").to_string();
+            let idle = p["idle_secs"].as_i64().unwrap_or(0);
+            let dot = if idle < 120 { Span::styled("● ", Style::default().fg(Color::Green)) }
+                      else { Span::styled("○ ", Style::default().fg(Color::DarkGray)) };
+            let mut lines = vec![Line::from(vec![
+                dot,
+                Span::styled(name, Style::default().add_modifier(Modifier::BOLD)),
+            ])];
+            let sub = if status.is_empty() { harness } else { format!("{harness} · {status}") };
+            if !sub.is_empty() {
+                lines.push(Line::from(Span::styled(format!("  {sub}"), Style::default().fg(Color::DarkGray))));
+            }
+            let h = lines.len() as u16;
+            if y + h > area.y + area.height { break; }
+            self.peer_vis.push((idx, y, h));
+            out.extend(lines);
+            y += h;
+            // context menu under the open peer
+            if self.peer_menu == Some(idx) {
+                let items: [(&str, MenuAction); 4] = [
+                    ("  ✉ message", MenuAction::Message),
+                    ("  ✂ kick", MenuAction::Kick),
+                    ("  → move…", MenuAction::Move),
+                    ("  ✕ close", MenuAction::Close),
+                ];
+                for (label, action) in items {
+                    if y >= area.y + area.height { break; }
+                    let rect = Rect::new(area.x, y, area.width, 1);
+                    self.menu_items.push((rect, action));
+                    out.push(Line::from(Span::styled(
+                        label.to_string(),
+                        Style::default().fg(Color::Cyan).bg(Color::Rgb(40, 44, 56)),
+                    )));
+                    y += 1;
+                }
+            }
+        }
+        out
+    }
+
+    fn menu_action(&mut self, action: MenuAction) {
+        let Some(idx) = self.peer_menu.take() else { return };
+        let Some(name) = self.peers.get(idx).and_then(|p| p["name"].as_str()).map(String::from) else { return };
+        match action {
+            MenuAction::Message => self.input = format!("@{name} "),
+            MenuAction::Move => self.input = format!("/move {name} "),
+            MenuAction::Kick => self.command(format!("kick {name}")),
+            MenuAction::Close => {}
+        }
+    }
+
     fn click(&mut self, col: u16, row: u16) {
+        // open menu intercepts clicks first
+        if self.peer_menu.is_some() {
+            if let Some(&(_, action)) = self.menu_items.iter().find(|(r, _)| {
+                col >= r.x && col < r.x + r.width && row == r.y
+            }) {
+                self.menu_action(action);
+            } else {
+                self.peer_menu = None;
+            }
+            return;
+        }
+        // peers panel: click opens the context menu
+        let pa = self.peers_area;
+        if col >= pa.x && col < pa.x + pa.width && row >= pa.y && row < pa.y + pa.height {
+            if let Some(&(idx, _, _)) = self.peer_vis.iter().find(|&&(_, y, h)| row >= y && row < y + h) {
+                self.peer_menu = Some(idx);
+            }
+            return;
+        }
+        // timeline: click toggles expand
         let a = self.msg_area;
         if col < a.x || col >= a.x + a.width || row < a.y || row >= a.y + a.height {
             return;
@@ -340,7 +525,10 @@ fn main() -> io::Result<()> {
         input: String::new(), status: String::new(), show_feed: false,
         expanded: HashSet::new(), selected: None, vis: vec![], msg_area: Rect::default(),
         suggest_idx: 0, quit: false,
+        rooms: vec![], peer_vis: vec![], peers_area: Rect::default(),
+        peer_menu: None, menu_items: vec![],
     };
+    app.fetch_rooms();
     app.refresh();
     app.status = format!(
         "room {} · {} msgs · {} feed · Tab=feed ↑↓=select Enter=send/expand /help=cmds q=quit",
@@ -366,6 +554,8 @@ fn main() -> io::Result<()> {
         let inner = Rect::new(cols[0].x + 1, cols[0].y + 1, cols[0].width.saturating_sub(2), cols[0].height.saturating_sub(2));
         let accent = if app.show_feed { Color::Cyan } else { gold };
         let timeline = app.build_timeline(inner, accent);
+        let peers_inner = Rect::new(cols[1].x + 1, cols[1].y + 1, cols[1].width.saturating_sub(2), cols[1].height.saturating_sub(2));
+        let peer_pane = app.build_peers(peers_inner);
         let main_title = if app.show_feed { " feed (ambient) " } else { " messages " };
 
         terminal.draw(|f| {
@@ -377,30 +567,12 @@ fn main() -> io::Result<()> {
                 cols[0],
             );
 
-            let peer_lines: Vec<ListItem> = app.peers.iter().map(|p| {
-                let name = p["name"].as_str().unwrap_or("?");
-                let harness = p["harness"].as_str().unwrap_or("");
-                let status = p["status"].as_str().unwrap_or("");
-                let idle = p["idle_secs"].as_i64().unwrap_or(0);
-                let dot = if idle < 120 { Span::styled("● ", Style::default().fg(Color::Green)) }
-                          else { Span::styled("○ ", Style::default().fg(Color::DarkGray)) };
-                let mut lines = vec![Line::from(vec![
-                    dot,
-                    Span::styled(name.to_string(), Style::default().add_modifier(Modifier::BOLD)),
-                ])];
-                let sub = if status.is_empty() { harness.to_string() } else { format!("{harness} · {status}") };
-                if !sub.is_empty() {
-                    lines.push(Line::from(Span::styled(format!("  {sub}"), Style::default().fg(Color::DarkGray))));
-                }
-                ListItem::new(lines)
-            }).collect();
             f.render_widget(
-                List::new(peer_lines).block(
-                    Block::default().borders(Borders::ALL).title(" peers ")
-                        .border_style(Style::default().fg(Color::DarkGray)),
-                ),
+                Block::default().borders(Borders::ALL).title(" peers (click for menu) ")
+                    .border_style(Style::default().fg(Color::DarkGray)),
                 cols[1],
             );
+            f.render_widget(Paragraph::new(peer_pane.clone()), peers_inner);
 
             f.render_widget(
                 Paragraph::new(app.input.as_str()).wrap(Wrap { trim: false }).block(
@@ -421,26 +593,18 @@ fn main() -> io::Result<()> {
                 let w = outer[1].width.min(72);
                 let area = Rect::new(outer[1].x, outer[1].y.saturating_sub(h), w, h);
                 f.render_widget(ratatui::widgets::Clear, area);
-                let typed = app.input.trim_start_matches('/');
-                let rows: Vec<Line> = sugg.iter().enumerate().map(|(i, (n, args, desc))| {
+                let rows: Vec<Line> = sugg.iter().enumerate().map(|(i, s)| {
                     let selected = i == app.suggest_idx.min(sugg.len() - 1);
                     let row_style = if selected {
                         Style::default().bg(Color::Rgb(40, 44, 56))
                     } else {
                         Style::default()
                     };
-                    let cmd_col = format!("/{n} {args}");
-                    let mut spans = vec![
-                        Span::styled(format!("/{typed}"), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                        Span::styled(n[typed.len()..].to_string(), Style::default().fg(Color::Cyan)),
-                        Span::styled(format!(" {args}"), Style::default().fg(Color::DarkGray)),
-                        Span::raw(" ".repeat(24usize.saturating_sub(cmd_col.len()))),
-                        Span::styled((*desc).to_string(), Style::default().fg(Color::Gray)),
-                    ];
-                    for s in &mut spans {
-                        s.style = s.style.patch(row_style);
-                    }
-                    Line::from(spans).style(row_style)
+                    Line::from(vec![
+                        Span::styled(s.label.clone(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD).patch(row_style)),
+                        Span::styled(" ".repeat(26usize.saturating_sub(s.label.chars().count())), row_style),
+                        Span::styled(s.desc.clone(), Style::default().fg(Color::Gray).patch(row_style)),
+                    ]).style(row_style)
                 }).collect();
                 f.render_widget(Paragraph::new(rows), area);
             }
@@ -470,7 +634,9 @@ fn main() -> io::Result<()> {
                         (KeyCode::Up, _) => app.select_move(-1),
                         (KeyCode::Down, _) => app.select_move(1),
                         (KeyCode::Esc, _) => {
-                            if app.input.is_empty() { app.selected = None; } else { app.input.clear(); }
+                            if app.peer_menu.is_some() { app.peer_menu = None; }
+                            else if app.input.is_empty() { app.selected = None; }
+                            else { app.input.clear(); }
                         }
                         (KeyCode::Backspace, _) => { app.input.pop(); app.suggest_idx = 0; }
                         (KeyCode::Char(c), m) if m.is_empty() || m == KeyModifiers::SHIFT => {
