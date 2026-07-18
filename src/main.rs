@@ -83,7 +83,7 @@ impl Db {
         Ok((id, backlog))
     }
 
-    fn post(&self, agent_id: i64, text: &str, to: Option<&str>, kind: &str, source_id: Option<&str>) -> rusqlite::Result<i64> {
+    fn post(&self, agent_id: i64, text: &str, to: Option<&str>, kind: &str, source_id: Option<&str>) -> rusqlite::Result<(i64, bool)> {
         let conn = self.0.lock().unwrap();
         let (room, name): (String, String) = conn.query_row(
             "SELECT room, name FROM agents WHERE id = ?1",
@@ -97,7 +97,7 @@ impl Db {
                 (&room, sid),
                 |r| r.get::<_, i64>(0),
             ) {
-                return Ok(existing);
+                return Ok((existing, false));
             }
         }
         conn.execute(
@@ -107,7 +107,7 @@ impl Db {
         let id = conn.last_insert_rowid();
         Self::touch(&conn, agent_id);
         conn.execute("DELETE FROM messages WHERE id <= ?1", [id - WINDOW])?;
-        Ok(id)
+        Ok((id, true))
     }
 
     fn inbox(&self, agent_id: i64) -> rusqlite::Result<Vec<serde_json::Value>> {
@@ -308,11 +308,11 @@ impl Agora {
     #[tool(description = "Post to your room. Broadcast by default; set `to` for a targeted message. Inbox kinds (msg/task/handoff/question/blocker) deliver to recipients; feed kinds (feed/summary/status/finding/decision/file_changed/test_result/review_finding) are ambient. source_id makes the post idempotent.")]
     fn post(&self, Parameters(p): Parameters<PostParams>) -> Result<CallToolResult, McpError> {
         let kind = p.kind.as_deref().unwrap_or("msg");
-        let id = self
+        let (id, new) = self
             .db
             .post(p.agent_id, &p.text, p.to.as_deref(), kind, p.source_id.as_deref())
             .map_err(db_err)?;
-        Ok(ok_json(json!({ "message_id": id })))
+        Ok(ok_json(json!({ "message_id": id, "new": new })))
     }
 
     #[tool(description = "Read recent ambient activity (kind=feed) from a room, optionally filtered to one agent. Never consumes inbox state; call only when you want to catch up on what peers are doing.")]
@@ -366,11 +366,40 @@ impl ServerHandler for Agora {
     }
 }
 
+#[derive(serde::Deserialize)]
+struct IngestReq {
+    room: String,
+    name: String,
+    #[serde(default)]
+    harness: String,
+    #[serde(default)]
+    machine: String,
+    body: String,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    source_id: Option<String>,
+}
+
+// plain HTTP door for the scribe daemon; tailnet-only like everything else
+async fn ingest(
+    axum::extract::State(db): axum::extract::State<Arc<Db>>,
+    axum::Json(req): axum::Json<IngestReq>,
+) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let err = |e: rusqlite::Error| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    let (agent_id, _) = db.join(&req.room, &req.name, &req.harness, &req.machine).map_err(err)?;
+    let (id, new) = db
+        .post(agent_id, &req.body, None, req.kind.as_deref().unwrap_or("summary"), req.source_id.as_deref())
+        .map_err(err)?;
+    Ok(axum::Json(json!({ "message_id": id, "new": new })))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = std::env::var("AGORA_ADDR").unwrap_or_else(|_| "127.0.0.1:8787".into());
     let db_path = std::env::var("AGORA_DB").unwrap_or_else(|_| "agora.db".into());
     let db = Arc::new(Db::open(&db_path)?);
+    let db_state = db.clone();
 
     // Host allowlist (rmcp DNS-rebinding guard): bind addr + bare host + localhost,
     // extend with AGORA_ALLOWED_HOSTS (comma-sep) for MagicDNS names like "substrate:8787".
@@ -388,7 +417,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         LocalSessionManager::default().into(),
         StreamableHttpServerConfig::default().with_allowed_hosts(allowed),
     );
-    let router = axum::Router::new().nest_service("/mcp", service);
+    let router = axum::Router::new()
+        .route("/ingest", axum::routing::post(ingest))
+        .with_state(db_state)
+        .nest_service("/mcp", service);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     println!("agora listening on http://{addr}/mcp (db: {db_path})");
     axum::serve(listener, router)
@@ -482,9 +514,9 @@ mod tests {
         let (a, _) = db.join("r", "alice", "", "").unwrap();
         let (b, _) = db.join("r", "bob", "", "").unwrap();
 
-        let m1 = db.post(a, "turn text", None, "summary", Some("uuid-1")).unwrap();
-        let m2 = db.post(a, "turn text", None, "summary", Some("uuid-1")).unwrap();
-        assert_eq!(m1, m2); // scribe can re-scan transcripts safely
+        let (m1, n1) = db.post(a, "turn text", None, "summary", Some("uuid-1")).unwrap();
+        let (m2, n2) = db.post(a, "turn text", None, "summary", Some("uuid-1")).unwrap();
+        assert_eq!(m1, m2); assert!(n1); assert!(!n2); // scribe can re-scan transcripts safely
         assert_eq!(db.feed("r", None, 20).unwrap().len(), 1);
         let _ = b;
     }
