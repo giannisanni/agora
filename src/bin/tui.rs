@@ -573,10 +573,12 @@ impl App {
             let name = p["name"].as_str().unwrap_or("?").to_string();
             let harness = p["harness"].as_str().unwrap_or("").to_string();
             let harness = if harness.is_empty() { "unknown".to_string() } else { harness };
+            let mirror = p["mirror"].as_bool().unwrap_or(false);
             let idle = p["idle_secs"].as_i64().unwrap_or(0);
-            // state by idle: parked resident pings every 1s (green); idle (yellow);
-            // stale/likely-dead (red). Color replaces the long status text.
-            let (dot_color, sel_color) = if idle < 90 { (Color::Green, Color::Green) }
+            // mirror identities (scribe reflections of live sessions) are dimmed
+            // gray; real agents use idle-state color (green/yellow/red).
+            let (dot_color, sel_color) = if mirror { (Color::DarkGray, Color::DarkGray) }
+                else if idle < 90 { (Color::Green, Color::Green) }
                 else if idle < 600 { (Color::Yellow, Color::Yellow) }
                 else { (Color::Red, Color::Red) };
             let sel = self.peers_focused && self.peer_sel == idx && self.peer_menu.is_none();
@@ -596,8 +598,9 @@ impl App {
                 lines.push(Line::from(spans));
             }
             let _ = sel_color;
-            // sub-line: harness only (short); state is in the dot color
-            lines.push(Line::from(Span::styled(format!("  {harness}"), Style::default().fg(Color::DarkGray))));
+            // sub-line: harness (+ mirror tag); state is in the dot color
+            let sub = if mirror { format!("{harness} · mirror") } else { harness };
+            lines.push(Line::from(Span::styled(format!("  {sub}"), Style::default().fg(Color::DarkGray))));
             let h = lines.len() as u16;
             if y + h > area.y + area.height { break; }
             self.peer_vis.push((idx, y, h));
@@ -633,7 +636,13 @@ impl App {
     fn menu_action(&mut self, action: MenuAction) {
         let Some(idx) = self.peer_menu.take() else { return };
         let Some(name) = self.peers.get(idx).and_then(|p| p["name"].as_str()).map(String::from) else { return };
+        let is_mirror = self.peers.get(idx).and_then(|p| p["mirror"].as_bool()).unwrap_or(false);
         match action {
+            // restart/kill only apply to agora-spawned agents; mirrors and
+            // hand-started agents aren't ours to control — say so instead of no-op.
+            MenuAction::Restart | MenuAction::Kill if is_mirror => {
+                self.status = format!("{name} mirrors a live session (via scribe) — not a controllable agent. Kick it to hide it.");
+            }
             MenuAction::Restart => {
                 self.orch(&["restart".to_string(), name.clone()]);
             }
@@ -862,7 +871,9 @@ fn main() -> io::Result<()> {
                     match (k.code, k.modifiers) {
                         (KeyCode::Char('c'), KeyModifiers::CONTROL) => break Ok(()),
                         (KeyCode::Char('q'), m) if app.input.is_empty() && m.is_empty() => break Ok(()),
-                        (KeyCode::Left, _) | (KeyCode::Right, _) if !popup => {
+                        // arrows only navigate when the input is empty, so they
+                        // don't fire while composing a message
+                        (KeyCode::Left, _) | (KeyCode::Right, _) if !popup && app.input.is_empty() => {
                             app.peers_focused = !app.peers_focused;
                             app.peer_menu = None;
                         }

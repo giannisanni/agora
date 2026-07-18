@@ -81,6 +81,7 @@ impl Db {
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN source_id TEXT", []);
         let _ = conn.execute("ALTER TABLE agents ADD COLUMN user TEXT NOT NULL DEFAULT 'owner'", []);
         let _ = conn.execute("ALTER TABLE agents ADD COLUMN park_secs INTEGER NOT NULL DEFAULT 600", []);
+        let _ = conn.execute("ALTER TABLE agents ADD COLUMN mirror INTEGER NOT NULL DEFAULT 0", []);
         conn.execute_batch(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_source
              ON messages(room, source_id) WHERE source_id IS NOT NULL;
@@ -225,7 +226,7 @@ impl Db {
     fn peers(&self, room: &str) -> rusqlite::Result<Vec<serde_json::Value>> {
         let conn = self.0.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT name, harness, machine, status, unixepoch() - last_seen, id FROM agents
+            "SELECT name, harness, machine, status, unixepoch() - last_seen, id, mirror FROM agents
              WHERE room = ?1 ORDER BY id ASC",
         )?;
         let rows = stmt
@@ -237,6 +238,7 @@ impl Db {
                     "status": r.get::<_, String>(3)?,
                     "idle_secs": r.get::<_, i64>(4)?,
                     "id": r.get::<_, i64>(5)?,
+                    "mirror": r.get::<_, i64>(6)? == 1,
                 }))
             })?
             .collect::<Result<_, _>>()?;
@@ -319,6 +321,11 @@ impl Db {
             .filter(|r| r.as_ref().map(|v| v["unread"].as_i64().unwrap_or(0) > 0).unwrap_or(true))
             .collect::<Result<_, _>>()?;
         Ok(rows)
+    }
+
+    fn set_mirror(&self, room: &str, name: &str) {
+        let conn = self.0.lock().unwrap();
+        let _ = conn.execute("UPDATE agents SET mirror = 1 WHERE room = ?1 AND name = ?2", (room, name));
     }
 
     fn park_secs(&self, agent_id: i64) -> rusqlite::Result<i64> {
@@ -934,6 +941,7 @@ async fn ingest(
         AgoraErr::NoSuchPeer(n) => (StatusCode::BAD_REQUEST, format!("no agent named '{n}' in this room")),
     };
     let (agent_id, _) = db.join(&req.room, &req.name, &req.harness, &req.machine, "owner").map_err(err)?;
+    db.set_mirror(&req.room, &req.name);
     let (id, new) = db
         .post(agent_id, "owner", &req.body, req.to.as_deref(), req.kind.as_deref().unwrap_or("summary"), req.source_id.as_deref())
         .map_err(err)?;
