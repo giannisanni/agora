@@ -108,7 +108,16 @@ fn main() {
                     format!("codex {p}{m_codex}")
                 }
                 "opencode" => format!("opencode run{m}"),
-                other => other.to_string(),
+                other => {
+                    // Unknown harness — refuse rather than trying to exec it as a
+                    // command (a bare model like "sonnet-5" landing here would loop
+                    // forever as "command not found"). Guide toward correct syntax.
+                    eprintln!(
+                        "unknown harness '{other}'. Use claude | codex | opencode. \
+                         For a model, use model:<id> (e.g. /spawn {name} claude model:{other})."
+                    );
+                    std::process::exit(2);
+                }
             };
             let prompt = join_prompt(&name, &room, &harness);
             // self-healing wrapper: if the agent process exits (turn ends /

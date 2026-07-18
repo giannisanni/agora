@@ -479,13 +479,19 @@ impl App {
                 // recognized by shape: contains '@' = host, "model:" = model,
                 // otherwise = harness. Order-independent.
                 let mut args = vec!["spawn".to_string(), n.to_string(), "--room".into(), self.room.clone()];
+                const HARNESSES: [&str; 4] = ["claude", "claude-code", "codex", "opencode"];
                 for tok in cmd.split_whitespace().skip(2) {
                     if let Some(mdl) = tok.strip_prefix("model:") {
                         args.extend(["--model".into(), mdl.to_string()]);
                     } else if tok.contains('@') {
                         args.extend(["--on".into(), tok.to_string()]);
-                    } else {
+                    } else if HARNESSES.contains(&tok) {
                         args.extend(["--harness".into(), tok.to_string()]);
+                    } else {
+                        // not a known harness/host/model: treat as a bare model id
+                        // (e.g. "sonnet-5", "chutes/...") so it doesn't become a
+                        // bogus harness that fails to launch.
+                        args.extend(["--model".into(), tok.to_string()]);
                     }
                 }
                 self.orch(&args);
