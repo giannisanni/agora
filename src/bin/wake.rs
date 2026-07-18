@@ -214,8 +214,16 @@ end tell"#
             Command::new("open").args(["-a", "Mosaic"]).status().is_ok()
         }
         Target::Tmux(pane) => {
-            // select the window holding the pane; can't force the host terminal forward
-            Command::new("tmux").args(["select-window", "-t", pane]).status().is_ok()
+            let _ = Command::new("tmux").args(["select-window", "-t", pane]).status();
+            let session = sh("tmux", &["display-message", "-p", "-t", pane, "#{session_name}"]);
+            let session = session.trim();
+            let attached = !sh("tmux", &["list-clients", "-t", session]).trim().is_empty();
+            if !attached && !session.is_empty() {
+                // detached session: nothing to raise — tell the user how to see it
+                println!("agent is in detached tmux session '{session}' — run: tmux attach -t {session}");
+                return false;
+            }
+            true
         }
     }
 }
@@ -288,7 +296,9 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let hub = std::env::var("AGORA_HUB").unwrap_or_else(|_| "http://100.84.87.107:8787".into());
     let home = std::env::var("HOME").expect("HOME not set");
-    let dirs = std::env::var("AGORA_WAKE_DIRS").unwrap_or_else(|_| format!("{home}/workspace"));
+    // wake only reads id-files (no transcript content), so it can safely scan
+    // all of $HOME — agents live in ~/workspace, ~/agora-agents, anywhere.
+    let dirs = std::env::var("AGORA_WAKE_DIRS").unwrap_or_else(|_| home.clone());
 
     if args.first().map(String::as_str) == Some("reveal") {
         let id: i64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(-1);
