@@ -177,16 +177,20 @@ impl App {
         self.suggest_idx = 0;
     }
     fn backspace(&mut self) {
+        // clamp first: cursor can never be trusted to match input length
+        self.cursor = self.cursor.min(self.input.chars().count());
         if self.cursor == 0 { return; }
-        let byte = self.input.char_indices().nth(self.cursor - 1).map(|(b, _)| b).unwrap();
-        self.input.remove(byte);
-        self.cursor -= 1;
+        if let Some((byte, _)) = self.input.char_indices().nth(self.cursor - 1) {
+            self.input.remove(byte);
+            self.cursor -= 1;
+        }
         self.suggest_idx = 0;
     }
     fn delete(&mut self) {
-        if self.cursor >= self.input.chars().count() { return; }
-        let byte = self.input.char_indices().nth(self.cursor).map(|(b, _)| b).unwrap();
-        self.input.remove(byte);
+        self.cursor = self.cursor.min(self.input.chars().count());
+        if let Some((byte, _)) = self.input.char_indices().nth(self.cursor) {
+            self.input.remove(byte);
+        }
     }
     fn move_left(&mut self) { self.cursor = self.cursor.saturating_sub(1); }
     fn move_right(&mut self) { self.cursor = (self.cursor + 1).min(self.input.chars().count()); }
@@ -194,6 +198,7 @@ impl App {
     fn end(&mut self) { self.cursor = self.input.chars().count(); }
     fn word_left(&mut self) {
         let ch: Vec<char> = self.input.chars().collect();
+        self.cursor = self.cursor.min(ch.len());
         while self.cursor > 0 && ch[self.cursor - 1].is_whitespace() { self.cursor -= 1; }
         while self.cursor > 0 && !ch[self.cursor - 1].is_whitespace() { self.cursor -= 1; }
     }
@@ -223,7 +228,7 @@ impl App {
         }
         if let Some(cmd) = text.strip_prefix('/') {
             self.command(cmd.to_string());
-            self.input.clear();
+            self.clear_input();
             return;
         }
         // leading @names (any number) = recipients; rest = body

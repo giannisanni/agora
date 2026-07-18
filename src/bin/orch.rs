@@ -20,7 +20,11 @@ fn sh_squote(s: &str) -> String {
 
 fn run(host: Option<&str>, script: &str) -> (bool, String) {
     let out = match host {
-        Some(h) => Command::new("ssh").args([h, script]).output(),
+        // BatchMode: never hang on an interactive auth prompt (e.g. Tailscale
+        // SSH re-auth) — fail fast with an error the caller can show.
+        Some(h) => Command::new("ssh")
+            .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", h, script])
+            .output(),
         None => Command::new("bash").args(["-c", script]).output(),
     };
     match out {
@@ -76,9 +80,12 @@ fn main() {
             // each harness otherwise uses its own configured default model.
             let m = model.as_deref().map(|m| format!(" --model {m}")).unwrap_or_default();
             let m_codex = model.as_deref().map(|m| format!(" -m {m}")).unwrap_or_default();
+            // non-interactive launch flags so first-run trust/permission
+            // prompts don't block a headless (esp. remote) spawn.
             let bin = match harness.as_str() {
-                "claude" | "claude-code" => format!("claude{m}"),
-                "codex" => format!("codex{m_codex}"),
+                "claude" | "claude-code" =>
+                    format!("claude --permission-mode acceptEdits --dangerously-skip-permissions{m}"),
+                "codex" => format!("codex --dangerously-bypass-approvals-and-sandbox{m_codex}"),
                 "opencode" => format!("opencode run{m}"),
                 other => other.to_string(),
             };
