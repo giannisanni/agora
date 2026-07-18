@@ -80,7 +80,10 @@ fn main() {
             std::process::exit(if ok { 0 } else { 1 });
         }
         "kill" => {
-            let (ok, out) = run(host, &format!("tmux kill-session -t agora-{name} && echo killed agora-{name}"));
+            // also drop the id-file so a reused agent_id can't mis-map reveal/wake
+            let (ok, out) = run(host, &format!(
+                "tmux kill-session -t agora-{name}; rm -f ~/agora-agents/{name}/.agora-agent-id; echo killed agora-{name}"
+            ));
             print!("{out}");
             std::process::exit(if ok { 0 } else { 1 });
         }

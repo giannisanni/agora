@@ -217,13 +217,23 @@ end tell"#
             let _ = Command::new("tmux").args(["select-window", "-t", pane]).status();
             let session = sh("tmux", &["display-message", "-p", "-t", pane, "#{session_name}"]);
             let session = session.trim();
-            let attached = !sh("tmux", &["list-clients", "-t", session]).trim().is_empty();
-            if !attached && !session.is_empty() {
-                // detached session: nothing to raise — tell the user how to see it
-                println!("agent is in detached tmux session '{session}' — run: tmux attach -t {session}");
+            if session.is_empty() {
                 return false;
             }
-            true
+            let attached = !sh("tmux", &["list-clients", "-t", session]).trim().is_empty();
+            if attached {
+                // already showing somewhere: raise Terminal (best-effort host)
+                return Command::new("open").args(["-a", "Terminal"]).status().is_ok();
+            }
+            // detached: open a real Terminal window attached to the session so
+            // the user actually SEES the agent
+            let script = format!(
+                r#"tell application "Terminal"
+activate
+do script "tmux attach -t {session}"
+end tell"#
+            );
+            Command::new("osascript").args(["-e", &script]).status().is_ok()
         }
     }
 }
