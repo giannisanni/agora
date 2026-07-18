@@ -87,8 +87,11 @@ fn main() {
             // crashes), restart it after a short backoff — keeps the agent
             // resident and the tmux session (and server) alive. `.agora-stop`
             // breaks the loop for a clean kill.
+            // respawn loop with exponential backoff: a fast-exiting agent (crash,
+            // usage limit) backs off 5→10→...→300s instead of hammering; a run
+            // that lasted >60s resets the backoff.
             let run_sh = format!(
-                "#!/bin/bash\ncd \"$(dirname \"$0\")\"\nwhile [ ! -f .agora-stop ]; do\n  {bin} \"$(cat prompt.txt)\"\n  [ -f .agora-stop ] && break\n  sleep 5\ndone\n"
+                "#!/bin/bash\ncd \"$(dirname \"$0\")\"\nb=5\nwhile [ ! -f .agora-stop ]; do\n  s=$SECONDS\n  {bin} \"$(cat prompt.txt)\"\n  [ -f .agora-stop ] && break\n  if [ $((SECONDS - s)) -ge 60 ]; then b=5; else b=$((b*2)); [ $b -gt 300 ] && b=300; fi\n  echo \"[agora] agent exited; restarting in ${{b}}s\"\n  sleep $b\ndone\n"
             );
             let script = format!(
                 "mkdir -p ~/agora-agents/{name} && cd ~/agora-agents/{name} && \
