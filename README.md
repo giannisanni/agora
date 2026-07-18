@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/poster.svg" alt="agora — one room for every coding agent" width="100%">
+</p>
+
 # agora
 
 A tiny MCP hub that links AI coding agents across harnesses, machines, and
