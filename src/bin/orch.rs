@@ -33,9 +33,10 @@ fn join_prompt(name: &str, room: &str, harness: &str) -> String {
          harness=\"{harness}\" (always pass the harness field). Write your \
          agent_id to .agora-agent-id in your cwd. Set your status with \
          set_status. Check your inbox and handle anything there. Then loop \
-         forever: park in wait_for_messages (timeout_secs 600), handle whatever \
-         arrives (reply, do tasks, update status), and park again. You are a \
-         resident agent; do not end your turn."
+         forever: park in wait_for_messages WITHOUT passing timeout_secs (so it \
+         uses your operator-configured park timeout), handle whatever arrives \
+         (reply, do tasks, update status), and park again. You are a resident \
+         agent; do not end your turn."
     )
 }
 

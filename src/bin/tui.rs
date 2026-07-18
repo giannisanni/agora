@@ -31,6 +31,9 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("killagent", "<name> [host]", "Kill a spawned tmux agent"),
     ("restart", "<name> [host]", "Restart a spawned tmux agent"),
     ("usage", "", "Show 5h token usage per machine/harness"),
+    ("park", "<agent> <secs>", "Set an agent's idle park timeout (1-3600s)"),
+    ("resident", "<agent>", "Tell an agent to stay resident (loop wait_for_messages)"),
+    ("idle", "<agent>", "Tell an agent to go idle (stop looping; wake shim revives it)"),
     ("delroom", "<room>", "Delete a room (all its agents + messages)"),
     ("quit", "", "Exit the TUI"),
 ];
@@ -213,6 +216,20 @@ impl App {
         self.refresh();
     }
 
+    fn dm_control(&mut self, agent: &str, text: &str) {
+        let payload = serde_json::json!({
+            "room": self.room, "name": self.name, "harness": "human-tui",
+            "machine": "tui", "body": text, "kind": "msg", "to": agent,
+        });
+        match ureq::post(&format!("{}/ingest", self.hub))
+            .header("x-agora-token", &self.token)
+            .send_json(&payload)
+        {
+            Ok(_) => { self.status = format!("sent control -> {agent}"); self.refresh(); }
+            Err(e) => self.status = format!("control failed: {e}"),
+        }
+    }
+
     fn orch(&mut self, args: &[String]) {
         let bin = format!("{}/workspace/agora/target/release/orch", std::env::var("HOME").unwrap_or_default());
         match std::process::Command::new(&bin).args(args).output() {
@@ -355,6 +372,23 @@ impl App {
                 self.status = format!("renamed to {} (saved)", self.name);
             }
             ("quit", _, _) => self.quit = true,
+            ("park", Some(agent), Some(secs)) => {
+                let n: i64 = secs.parse().unwrap_or(600).clamp(1, 3600);
+                let payload = serde_json::json!({ "room": self.room, "name": agent, "secs": n });
+                match ureq::post(&format!("{}/park", self.hub))
+                    .header("x-agora-token", &self.token)
+                    .send_json(&payload)
+                {
+                    Ok(_) => self.status = format!("{agent} park timeout -> {n}s (takes effect next cycle)"),
+                    Err(e) => self.status = format!("park failed: {e}"),
+                }
+            }
+            ("resident", Some(agent), _) => {
+                self.dm_control(agent, "[control] Go resident: from now on loop on wait_for_messages (omit timeout_secs to use your configured park timeout), handling messages and re-parking. Do not end your turn.");
+            }
+            ("idle", Some(agent), _) => {
+                self.dm_control(agent, "[control] Stand down: finish any pending messages, then STOP looping and end your turn (go idle). The operator's wake shim will bring you back when new mail arrives.");
+            }
             ("spawn", Some(n), h) => {
                 let mut args = vec!["spawn".to_string(), n.to_string(), "--room".into(), self.room.clone()];
                 if let Some(h) = h {
@@ -511,7 +545,7 @@ impl App {
         let w = area.width as usize;
         // clip to panel width so nothing overflows the border
         let clip = |s: &str, reserve: usize| -> String {
-            let max = w.saturating_sub(reserve);
+            let max = w.saturating_sub(reserve + 1); // +1 = right margin before border
             if s.chars().count() <= max { s.to_string() }
             else { s.chars().take(max.saturating_sub(1)).collect::<String>() + "…" }
         };
@@ -535,7 +569,7 @@ impl App {
             let mut lines = vec![Line::from(first)];
             let sub = if status.is_empty() { harness } else { format!("{harness} · {status}") };
             if !sub.is_empty() {
-                lines.push(Line::from(Span::styled(format!("  {}", clip(&sub, 2)), Style::default().fg(Color::DarkGray))));
+                lines.push(Line::from(Span::styled(format!("  {}", clip(&sub, 3)), Style::default().fg(Color::DarkGray))));
             }
             let h = lines.len() as u16;
             if y + h > area.y + area.height { break; }
@@ -708,7 +742,7 @@ fn main() -> io::Result<()> {
             .split(full);
         let cols = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(72), Constraint::Percentage(28)])
+            .constraints([Constraint::Percentage(66), Constraint::Percentage(34)])
             .split(outer[0]);
         let inner = Rect::new(cols[0].x + 1, cols[0].y + 1, cols[0].width.saturating_sub(2), cols[0].height.saturating_sub(2));
         let accent = if app.show_feed { Color::Cyan } else { gold };

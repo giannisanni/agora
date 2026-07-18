@@ -80,6 +80,7 @@ impl Db {
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL DEFAULT 'msg'", []);
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN source_id TEXT", []);
         let _ = conn.execute("ALTER TABLE agents ADD COLUMN user TEXT NOT NULL DEFAULT 'owner'", []);
+        let _ = conn.execute("ALTER TABLE agents ADD COLUMN park_secs INTEGER NOT NULL DEFAULT 600", []);
         conn.execute_batch(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_source
              ON messages(room, source_id) WHERE source_id IS NOT NULL;
@@ -318,6 +319,16 @@ impl Db {
             .filter(|r| r.as_ref().map(|v| v["unread"].as_i64().unwrap_or(0) > 0).unwrap_or(true))
             .collect::<Result<_, _>>()?;
         Ok(rows)
+    }
+
+    fn park_secs(&self, agent_id: i64) -> rusqlite::Result<i64> {
+        let conn = self.0.lock().unwrap();
+        conn.query_row("SELECT park_secs FROM agents WHERE id = ?1", [agent_id], |r| r.get(0))
+    }
+
+    fn set_park(&self, room: &str, name: &str, secs: i64) -> rusqlite::Result<usize> {
+        let conn = self.0.lock().unwrap();
+        conn.execute("UPDATE agents SET park_secs = ?1 WHERE room = ?2 AND name = ?3", (secs.clamp(1, 3600), room, name))
     }
 
     fn rename_agent(&self, room: &str, old: &str, new: &str) -> rusqlite::Result<usize> {
@@ -576,14 +587,16 @@ impl Agora {
         Ok(ok_json(json!({ "feed": entries })))
     }
 
-    #[tool(description = "Block until a message arrives for you (or timeout), then return it like inbox. Terminal-agnostic wake: call this when idle and waiting for another agent.")]
+    #[tool(description = "Block until a message arrives for you (or timeout), then return it like inbox. Terminal-agnostic wake: call this when idle and waiting. Omit timeout_secs to use your server-configured park timeout (settable by the operator), which lets the operator retune your idle cadence without restarting you.")]
     async fn wait_for_messages(
         &self,
         Parameters(p): Parameters<WaitParams>,
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
         let user = caller(&parts);
-        let timeout = p.timeout_secs.unwrap_or(60).min(300);
+        // explicit arg wins; otherwise the agent's stored park_secs. Cap 1h.
+        let configured = self.db.park_secs(p.agent_id).unwrap_or(600).max(0) as u64;
+        let timeout = p.timeout_secs.unwrap_or(configured).clamp(1, 3600);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
         loop {
             let msgs = self.db.inbox(p.agent_id, &user).map_err(agora_err)?;
@@ -829,6 +842,25 @@ async fn http_heartbeat(
 }
 
 #[derive(serde::Deserialize)]
+struct ParkReq {
+    room: String,
+    name: String,
+    secs: i64,
+}
+
+async fn http_park(
+    axum::extract::State(db): axum::extract::State<Arc<Db>>,
+    headers: axum::http::HeaderMap,
+    axum::Json(req): axum::Json<ParkReq>,
+) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    check_token(&headers)?;
+    let n = db
+        .set_park(&req.room, &req.name, req.secs)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(axum::Json(json!({ "updated": n, "secs": req.secs.clamp(1, 3600) })))
+}
+
+#[derive(serde::Deserialize)]
 struct RenameReq {
     room: String,
     old: String,
@@ -930,6 +962,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/usage", axum::routing::get(http_usage_get).post(http_usage_post))
         .route("/heartbeat", axum::routing::post(http_heartbeat))
         .route("/rename", axum::routing::post(http_rename))
+        .route("/park", axum::routing::post(http_park))
         .route("/wakeable", axum::routing::get(http_wakeable))
         .with_state(db_state)
         .nest_service("/mcp", service);
