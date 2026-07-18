@@ -75,6 +75,7 @@ enum Target {
     Tmux(String),
     Mosaic(String),
     Iterm(String),
+    Terminal(String), // Apple Terminal.app tty
 }
 
 /// All local terminals as (target, cwd).
@@ -117,6 +118,25 @@ end tell"#;
             }
         }
     }
+    // Apple Terminal.app: keyed by tty, which we match to a cwd
+    let term_script = r#"tell application "Terminal"
+set out to ""
+repeat with w in windows
+repeat with t in tabs of w
+set out to out & (tty of t) & linefeed
+end repeat
+end repeat
+return out
+end tell"#;
+    for line in sh("osascript", &["-e", term_script]).lines() {
+        let tty_full = line.trim();
+        let tty = tty_full.strip_prefix("/dev/").unwrap_or(tty_full);
+        if !tty.is_empty() {
+            if let Some(cwd) = tty_cwd(tty) {
+                out.push((Target::Terminal(tty_full.to_string()), cwd));
+            }
+        }
+    }
     out
 }
 
@@ -145,6 +165,23 @@ end repeat
 end tell"#,
                 sid = sid,
                 text = text.replace('"', "\\\""),
+            );
+            Command::new("osascript").args(["-e", &script]).status().is_ok()
+        }
+        Target::Terminal(tty) => {
+            // `do script ... in tab whose tty` types + runs in that Terminal tab
+            let script = format!(
+                r#"tell application "Terminal"
+repeat with w in windows
+repeat with t in tabs of w
+if (tty of t) is "{tty}" then
+do script "{text}" in t
+end if
+end repeat
+end repeat
+end tell"#,
+                tty = tty,
+                text = text.replace('\\', "\\\\").replace('"', "\\\""),
             );
             Command::new("osascript").args(["-e", &script]).status().is_ok()
         }
