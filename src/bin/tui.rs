@@ -438,7 +438,16 @@ impl App {
                     .header("x-agora-token", &self.token)
                     .send_json(&payload)
                 {
-                    Ok(_) => { self.status = format!("kicked: {}", names.join(", ")); self.refresh(); }
+                    Ok(_) => {
+                        // also stop any local tmux process for each kicked agent so a
+                        // spawned resident doesn't linger (the hub guard makes it go
+                        // idle either way, but this actually frees the session).
+                        for n in &names {
+                            self.orch(&["kill".to_string(), n.clone()]);
+                        }
+                        self.status = format!("kicked + stopped: {}", names.join(", "));
+                        self.refresh();
+                    }
                     Err(e) => self.status = format!("kick failed: {e}"),
                 }
             }

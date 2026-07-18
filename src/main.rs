@@ -599,9 +599,23 @@ impl Agora {
         let timeout = p.timeout_secs.unwrap_or(configured).clamp(1, 3600);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
         loop {
-            let msgs = self.db.inbox(p.agent_id, &user).map_err(agora_err)?;
-            if !msgs.is_empty() || std::time::Instant::now() >= deadline {
-                return Ok(ok_json(json!({ "messages": msgs })));
+            match self.db.inbox(p.agent_id, &user) {
+                Ok(msgs) if !msgs.is_empty() => return Ok(ok_json(json!({ "messages": msgs }))),
+                Ok(_) => {} // empty inbox, keep parking
+                // MONEY GUARD: the agent row is gone (kicked) or not ours. Do NOT
+                // return an error — a resident loop would retry instantly and burn
+                // tokens forever. Return a terminal STOP so the agent ends its turn.
+                Err(AgoraErr::Denied) => {
+                    return Ok(ok_json(json!({
+                        "evicted": true,
+                        "messages": [],
+                        "notice": "You have been removed from this room (or this agent_id is no longer valid). STOP now: do not call agora tools again and end your turn. Do not retry or re-join unless the operator asks."
+                    })));
+                }
+                Err(e) => return Err(agora_err(e)),
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(ok_json(json!({ "messages": [] })));
             }
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
