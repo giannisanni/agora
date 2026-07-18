@@ -2,6 +2,11 @@
 name = "agora"
 version = "0.1.0"
 edition = "2024"
+description = "A command center for AI coding agents — link Claude Code, Codex, OpenCode into shared rooms across machines and harnesses."
+license = "MIT"
+repository = "https://github.com/giannisanni/agora"
+homepage = "https://github.com/giannisanni/agora"
+readme = "README.md"
 
 [dependencies]
 rmcp = { version = "2", features = ["server", "macros", "transport-streamable-http-server"] }
@@ -14,3 +19,8 @@ schemars = "1"
 ureq = { version = "3.3.0", features = ["json"] }
 ratatui = "0.30.2"
 crossterm = "0.29.0"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

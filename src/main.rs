@@ -979,8 +979,56 @@ async fn ingest(
     Ok(axum::Json(json!({ "message_id": id, "new": new })))
 }
 
+/// Dispatch to a sibling binary installed alongside this one (packaged
+/// releases put agora/tui/scribe/wake/orch in the same dir). Lets the single
+/// `agora` command front the whole toolset: `agora tui`, `agora spawn`, etc.
+/// Returns if there's nothing to dispatch (so main() runs the hub).
+fn dispatch() {
+    let args: Vec<String> = std::env::args().collect();
+    let sub = args.get(1).map(String::as_str).unwrap_or("");
+    // map subcommand -> sibling binary + args to forward
+    let (bin, forward): (&str, Vec<String>) = match sub {
+        "hub" | "serve" => return, // run the hub below, minus the subcommand
+        "cli" | "tui" => ("tui", args[2..].to_vec()),
+        "scribe" => ("scribe", args[2..].to_vec()),
+        "wake" => ("wake", args[2..].to_vec()),
+        "spawn" | "kill" | "restart" | "agents" => ("orch", args[1..].to_vec()),
+        "" => ("tui", vec![]), // bare `agora` opens the command center
+        _ => return,           // unknown -> fall through to hub (or its arg parsing)
+    };
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let target = dir.join(bin);
+            let path = if target.exists() { target } else { std::path::PathBuf::from(bin) };
+            let err = std::process::Command::new(path).args(&forward).exec_or_status();
+            std::process::exit(err);
+        }
+    }
+    eprintln!("could not locate sibling binary '{bin}'");
+    std::process::exit(1);
+}
+
+// exec on unix (replace process), spawn+wait elsewhere
+trait ExecOrStatus {
+    fn exec_or_status(&mut self) -> i32;
+}
+impl ExecOrStatus for std::process::Command {
+    #[cfg(unix)]
+    fn exec_or_status(&mut self) -> i32 {
+        use std::os::unix::process::CommandExt;
+        let e = self.exec(); // only returns on failure
+        eprintln!("exec failed: {e}");
+        1
+    }
+    #[cfg(not(unix))]
+    fn exec_or_status(&mut self) -> i32 {
+        self.status().ok().and_then(|s| s.code()).unwrap_or(1)
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    dispatch(); // fronts tui/scribe/wake/orch; returns only to run the hub
     let addr = std::env::var("AGORA_ADDR").unwrap_or_else(|_| "127.0.0.1:8787".into());
     let db_path = std::env::var("AGORA_DB").unwrap_or_else(|_| "agora.db".into());
     let db = Arc::new(Db::open(&db_path)?);
