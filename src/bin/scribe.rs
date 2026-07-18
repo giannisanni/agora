@@ -38,15 +38,25 @@ fn main() {
     let machine = std::env::var("AGORA_MACHINE").unwrap_or_else(|_| hostname());
     let home = std::env::var("HOME").expect("HOME not set");
     let once = std::env::args().any(|a| a == "--once");
+    // privacy boundary: only sessions whose cwd is under one of these path
+    // prefixes are mirrored. Unset AGORA_DIRS = mirror nothing (opt-in, not
+    // opt-out: an always-on daemon must never leak personal sessions).
+    let dirs: Vec<String> = std::env::var("AGORA_DIRS")
+        .map(|v| v.split(',').map(|s| s.trim().trim_end_matches('/').to_string()).filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default();
+    if dirs.is_empty() {
+        eprintln!("AGORA_DIRS not set (comma-separated cwd prefixes to mirror); refusing to mirror everything");
+        std::process::exit(1);
+    }
 
-    println!("scribe: room={room} hub={hub} machine={machine}");
+    println!("scribe: room={room} hub={hub} machine={machine} dirs={dirs:?}");
     loop {
         let mut posted = 0;
         for file in active_files(&format!("{home}/.claude/projects"), "jsonl") {
-            posted += mirror(&hub, &room, &machine, "claude-code", &file, parse_claude);
+            posted += mirror(&hub, &room, &machine, "claude-code", &file, parse_claude, &dirs);
         }
         for file in active_files(&format!("{home}/.codex/sessions"), "jsonl") {
-            posted += mirror(&hub, &room, &machine, "codex", &file, parse_codex);
+            posted += mirror(&hub, &room, &machine, "codex", &file, parse_codex, &dirs);
         }
         if posted > 0 {
             println!("scribe: mirrored {posted} turns");
@@ -100,11 +110,22 @@ fn mirror(
     harness: &str,
     file: &Path,
     parse: fn(&str) -> Vec<Turn>,
+    dirs: &[String],
 ) -> usize {
     let session = file.file_stem().and_then(|s| s.to_str()).unwrap_or("session");
     let short = &session[..session.len().min(8)];
     let name = format!("{machine}-{harness}");
-    let turns = parse(&read_tail(file));
+    let tail = read_tail(file);
+    let cwd = match harness {
+        "claude-code" => cwd_from_lines(&tail),
+        _ => cwd_from_head(file),
+    };
+    // unknown cwd -> skip: never mirror what we can't attribute to a project
+    let Some(cwd) = cwd else { return 0 };
+    if !dirs.iter().any(|d| cwd == *d || cwd.starts_with(&format!("{d}/"))) {
+        return 0;
+    }
+    let turns = parse(&tail);
     let mut posted = 0;
     for turn in turns.iter().rev().take(MAX_TURNS_PER_FILE).rev() {
         let body: String = format!("[{short}] {}: {}", turn.role, turn.text)
@@ -137,6 +158,29 @@ fn mirror(
         }
     }
     posted
+}
+
+/// First `cwd` field found in jsonl lines (Claude Code puts it on many line types).
+fn cwd_from_lines(jsonl: &str) -> Option<String> {
+    jsonl.lines().find_map(|line| {
+        serde_json::from_str::<serde_json::Value>(line)
+            .ok()?
+            .get("cwd")?
+            .as_str()
+            .map(String::from)
+    })
+}
+
+/// Codex: `session_meta` head line carries payload.cwd.
+fn cwd_from_head(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; 8192];
+    let n = f.read(&mut buf).ok()?;
+    let head = String::from_utf8_lossy(&buf[..n]);
+    let first = head.lines().next()?;
+    let v: serde_json::Value = serde_json::from_str(first).ok()?;
+    v["payload"]["cwd"].as_str().map(String::from)
 }
 
 fn read_tail(path: &Path) -> String {
@@ -244,6 +288,21 @@ mod tests {
         assert_eq!(turns[0].text, "real question");
         assert_eq!(turns[1].text, "real answer");
         assert_eq!(turns[1].source_id, "u5");
+    }
+
+    #[test]
+    fn cwd_extraction_and_prefix_semantics() {
+        let jsonl = r#"{"type":"attachment","cwd":"/Users/g/workspace/agora"}
+{"type":"user","uuid":"u1","message":{"content":"hi"}}"#;
+        assert_eq!(cwd_from_lines(jsonl).as_deref(), Some("/Users/g/workspace/agora"));
+        assert_eq!(cwd_from_lines(r#"{"type":"user"}"#), None);
+
+        // prefix must match on path boundaries: /Users/g/work must NOT match /Users/g/workspace
+        let dirs = vec!["/Users/g/work".to_string()];
+        let matches = |cwd: &str| dirs.iter().any(|d| cwd == *d || cwd.starts_with(&format!("{d}/")));
+        assert!(matches("/Users/g/work"));
+        assert!(matches("/Users/g/work/x"));
+        assert!(!matches("/Users/g/workspace/agora"));
     }
 
     #[test]

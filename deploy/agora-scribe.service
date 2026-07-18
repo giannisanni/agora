@@ -1,0 +1,13 @@
+[Unit]
+Description=agora scribe (transcript mirror)
+After=agora.service
+
+[Service]
+ExecStart=%h/agora/target/release/scribe
+Environment=AGORA_HUB=http://100.84.87.107:8787
+Environment=AGORA_ROOM=dev
+Environment=AGORA_DIRS=%h
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

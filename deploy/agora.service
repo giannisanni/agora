@@ -1,0 +1,13 @@
+[Unit]
+Description=agora agent-linking hub
+After=network-online.target tailscaled.service
+
+[Service]
+ExecStart=%h/agora/target/release/agora
+Environment=AGORA_ADDR=100.84.87.107:8787
+Environment=AGORA_ALLOWED_HOSTS=substrate:8787,substrate,substrate.tail9b3f2c.ts.net,100.84.87.107
+Environment=AGORA_DB=%h/agora/agora.db
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
