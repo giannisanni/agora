@@ -176,7 +176,9 @@ fn mirror(
 ) -> usize {
     let session = file.file_stem().and_then(|s| s.to_str()).unwrap_or("session");
     let short = &session[..session.len().min(8)];
-    let name = format!("{machine}-{harness}");
+    // one mirror identity per machine (not per harness) — the scribe is a plain
+    // daemon, not an agent. Harness/session stays visible in each turn's prefix.
+    let name = format!("{machine}-scribe");
     let tail = read_tail(file);
     let cwd = match harness {
         "claude-code" => cwd_from_lines(&tail),
@@ -190,14 +192,14 @@ fn mirror(
     let turns = parse(&tail);
     let mut posted = 0;
     for turn in turns.iter().rev().take(MAX_TURNS_PER_FILE).rev() {
-        let body: String = format!("[{short}] {}: {}", turn.role, turn.text)
+        let body: String = format!("[{harness} {short}] {}: {}", turn.role, turn.text)
             .chars()
             .take(MAX_BODY_CHARS)
             .collect();
         let payload = serde_json::json!({
             "room": room,
             "name": name,
-            "harness": harness,
+            "harness": "scribe",
             "machine": machine,
             "body": body,
             "kind": "summary",
