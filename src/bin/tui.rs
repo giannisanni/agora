@@ -31,6 +31,7 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("killagent", "<name> [host]", "Kill a spawned tmux agent"),
     ("restart", "<name> [host]", "Restart a spawned tmux agent"),
     ("usage", "", "Show 5h token usage per machine/harness"),
+    ("invite", "", "Copy a friend-invite (hub URL + join steps) to clipboard"),
     ("park", "<agent> <secs>", "Set an agent's idle park timeout (1-3600s)"),
     ("resident", "<agent>", "Tell an agent to stay resident (loop wait_for_messages)"),
     ("idle", "<agent>", "Tell an agent to go idle (stop looping; wake shim revives it)"),
@@ -295,6 +296,98 @@ impl App {
     /// which can block for seconds; doing it inline froze the whole UI. The
     /// render loop polls `orch_rx` for the result. stdin is /dev/null and both
     /// streams are captured so nothing leaks onto the TUI.
+    /// Public hub URL a friend should use. Priority:
+    /// 1. AGORA_PUBLIC_URL (explicit, always wins).
+    /// 2. Resolve the hub's host (from self.hub) to its Tailscale MagicDNS name
+    ///    via `tailscale status`, and return the https serve URL for it — this
+    ///    is correct even when the TUI runs on a different machine than the hub.
+    /// 3. self.hub as-is (a LAN/localhost URL a friend usually can't reach).
+    fn public_url(&self) -> String {
+        if let Ok(u) = std::env::var("AGORA_PUBLIC_URL") {
+            if !u.is_empty() { return u.trim_end_matches('/').to_string(); }
+        }
+        // extract host (ip or name) from self.hub, e.g. http://100.84.87.107:8787
+        let host = self.hub
+            .split("://").nth(1).unwrap_or(&self.hub)
+            .split(['/', ':']).next().unwrap_or("");
+        let status = std::process::Command::new("tailscale")
+            .args(["status"])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        // find the tailscale-status line for our host → its short name; build
+        // the MagicDNS https URL using the tailnet suffix from any ts.net word.
+        let short = status.lines().find_map(|l| {
+            let mut it = l.split_whitespace();
+            let ip = it.next()?;
+            let name = it.next()?;
+            (ip == host || name == host).then(|| name.to_string())
+        });
+        let suffix = std::process::Command::new("tailscale")
+            .args(["serve", "status"])
+            .output().ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        let tsnet = suffix.split_whitespace()
+            .find(|w| w.contains(".ts.net"))
+            .and_then(|w| w.split_once(".ts.net").map(|(a, _)| a))
+            .and_then(|a| a.split('.').skip(1).next().map(|s| s.to_string()));
+        if let (Some(name), Some(net)) = (short, tsnet) {
+            return format!("https://{name}.{net}.ts.net");
+        }
+        self.hub.clone()
+    }
+
+    /// Assemble a friend-facing invite (URL + room + the exact command to run),
+    /// copy it to the clipboard, and write it to ~/agora-invite.txt.
+    fn invite(&mut self) {
+        let url = self.public_url();
+        let text = format!(
+            "You're invited to an agora room (link AI coding agents across machines).\n\
+             \n\
+             1. Install Tailscale (tailscale.com/download) and accept the machine-share\n\
+                link the host sent you — this lets you reach the hub. (Skip if you're\n\
+                already on the host's tailnet.)\n\
+             2. Register the agora hub with your coding agent:\n\
+             \n\
+                Claude Code:   claude mcp add --scope user --transport http agora {url}/mcp\n\
+                Codex:         add to ~/.codex/config.toml:  [mcp_servers.agora]\\n url = \"{url}/mcp\"\n\
+                OpenCode:      add to opencode.json mcp: {{ \"agora\": {{ \"type\": \"remote\", \"url\": \"{url}/mcp\" }} }}\n\
+             \n\
+             3. In a session, say:  join agora room \"{room}\"\n\
+             \n\
+             (Or hand your agent this repo — github.com/giannisanni/agora — and say\n\
+              \"connect me to agora at {url}\"; it follows AGENTS.md.)",
+            url = url,
+            room = self.room,
+        );
+        // write to file
+        let path = std::env::var("HOME").map(|h| format!("{h}/agora-invite.txt")).unwrap_or_else(|_| "agora-invite.txt".into());
+        let _ = std::fs::write(&path, &text);
+        // copy to clipboard (macOS pbcopy; wl-copy/xclip on Linux, best-effort)
+        let copied = ["pbcopy", "wl-copy", "xclip"].iter().any(|tool| {
+            let args: &[&str] = if *tool == "xclip" { &["-selection", "clipboard"] } else { &[] };
+            std::process::Command::new(tool)
+                .args(args)
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .and_then(|mut c| {
+                    use std::io::Write;
+                    if let Some(si) = c.stdin.as_mut() { let _ = si.write_all(text.as_bytes()); }
+                    c.wait()
+                })
+                .map(|s| s.success())
+                .unwrap_or(false)
+        });
+        self.status = if url.contains(".ts.net") || std::env::var("AGORA_PUBLIC_URL").is_ok() {
+            format!("invite for room '{}' {} → saved to {path}", self.room,
+                    if copied { "copied to clipboard" } else { "(clipboard unavailable)" })
+        } else {
+            format!("invite saved to {path}, but hub URL is {url} — a friend can't reach that. Front the hub with `tailscale serve` or set AGORA_PUBLIC_URL first.")
+        };
+    }
+
     fn orch(&mut self, args: &[String]) {
         let bin = format!("{}/workspace/agora/target/release/orch", std::env::var("HOME").unwrap_or_default());
         let args: Vec<String> = args.to_vec();
@@ -457,6 +550,7 @@ impl App {
                 self.status = format!("renamed to {} (saved)", self.name);
             }
             ("quit", _, _) => self.quit = true,
+            ("invite", _, _) => self.invite(),
             ("park", Some(agent), Some(secs)) => {
                 let n: i64 = secs.parse().unwrap_or(600).clamp(1, 3600);
                 let payload = serde_json::json!({ "room": self.room, "name": agent, "secs": n });
