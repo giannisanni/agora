@@ -79,10 +79,33 @@ Accepted for phase 1; the wake shim (below) buys it back later.
 | tty/pid binding flakiness | heartbeat presence |
 | App/OS lock-in | plain MCP + HTTP + SQLite |
 
+## Borrowed from Mosaic source (2026-07-17 review of MosaicCollaboration pkg)
+
+Shipped:
+- Typed kind taxonomy with per-kind delivery class: inbox kinds
+  (msg/task/handoff/question/blocker) deliver; feed kinds
+  (feed/summary/status/finding/decision/file_changed/test_result/review_finding)
+  are ambient pull-only. Their insight: the room is a semantic ledger, not chat.
+- source_id idempotency (their sourceID dedup) — reposting the same source_id
+  returns the existing message. Prerequisite for a safe transcript scribe.
+- Bounded reads: feed bodies capped at 800 chars (their digest bound).
+
+For the scribe (spec copied from ClaudeTranscriptFileParser.swift):
+- Read last 512KB tail of CC jsonl, drop first (truncated) line.
+- Keep only user/assistant text; skip isMeta, isSidechain, tool-only content,
+  and slash-command echoes (text starting `<command-` / `<local-command-`).
+- Use line uuid as source_id; drop turns older than cutoff (timestamp, else
+  file mtime).
+- Loop prevention (their relayPromptHeaderPrefixes): never re-post content the
+  hub itself injected; mark injected text with a fixed prefix and filter it.
+
+Rejected: read-only data-source terminals (assumes shared filesystem/CLI,
+doesn't fit cross-machine); active typed-into-terminal dispatch (replaced by
+wait_for_messages long-poll).
+
 ## Deferred (YAGNI until proven needed)
 
-- Wake shim: optional per-machine daemon; polls hub for undelivered mail to
-  idle local agents, types into their tmux pane. Phase 2, opt-in.
+- Scribe daemon (transcript tailing -> post kind=summary w/ source_id).
 - File/artifact transfer, nested rooms, long-term message persistence,
   message threading, delivery receipts.
 
