@@ -43,6 +43,7 @@ fn caller(parts: &Parts) -> String {
 struct Db(Mutex<Connection>);
 
 const BACKLOG: i64 = 20;
+const SAFE_WAIT_SECS: u64 = 240; // max single wait_for_messages hold; the MCP HTTP transport recycles longer-held requests
 const WINDOW: i64 = 5000; // rolling message window kept in the db
 const FEED_BODY_CAP: usize = 800; // Mosaic-style bound: feed reads truncate long bodies
 
@@ -80,7 +81,7 @@ impl Db {
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL DEFAULT 'msg'", []);
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN source_id TEXT", []);
         let _ = conn.execute("ALTER TABLE agents ADD COLUMN user TEXT NOT NULL DEFAULT 'owner'", []);
-        let _ = conn.execute("ALTER TABLE agents ADD COLUMN park_secs INTEGER NOT NULL DEFAULT 600", []);
+        let _ = conn.execute("ALTER TABLE agents ADD COLUMN park_secs INTEGER NOT NULL DEFAULT 180", []);
         let _ = conn.execute("ALTER TABLE agents ADD COLUMN mirror INTEGER NOT NULL DEFAULT 0", []);
         conn.execute_batch(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_source
@@ -335,7 +336,7 @@ impl Db {
 
     fn set_park(&self, room: &str, name: &str, secs: i64) -> rusqlite::Result<usize> {
         let conn = self.0.lock().unwrap();
-        conn.execute("UPDATE agents SET park_secs = ?1 WHERE room = ?2 AND name = ?3", (secs.clamp(1, 3600), room, name))
+        conn.execute("UPDATE agents SET park_secs = ?1 WHERE room = ?2 AND name = ?3", (secs.clamp(1, SAFE_WAIT_SECS as i64), room, name))
     }
 
     fn rename_agent(&self, room: &str, old: &str, new: &str) -> rusqlite::Result<usize> {
@@ -603,7 +604,7 @@ impl Agora {
         let user = caller(&parts);
         // explicit arg wins; otherwise the agent's stored park_secs. Cap 1h.
         let configured = self.db.park_secs(p.agent_id).unwrap_or(600).max(0) as u64;
-        let timeout = p.timeout_secs.unwrap_or(configured).clamp(1, 3600);
+        let timeout = p.timeout_secs.unwrap_or(configured).clamp(1, SAFE_WAIT_SECS);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
         loop {
             match self.db.inbox(p.agent_id, &user) {
@@ -878,7 +879,7 @@ async fn http_park(
     let n = db
         .set_park(&req.room, &req.name, req.secs)
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(axum::Json(json!({ "updated": n, "secs": req.secs.clamp(1, 3600) })))
+    Ok(axum::Json(json!({ "updated": n, "secs": req.secs.clamp(1, SAFE_WAIT_SECS as i64) })))
 }
 
 #[derive(serde::Deserialize)]
