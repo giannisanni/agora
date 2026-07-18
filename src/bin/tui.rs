@@ -52,6 +52,9 @@ struct App {
     peers_area: Rect,
     peer_menu: Option<usize>,         // open menu for peer idx
     menu_items: Vec<(Rect, MenuAction)>,
+    peers_focused: bool,              // ←/→ switches focus between panes
+    peer_sel: usize,                  // keyboard-selected peer
+    menu_sel: usize,                  // keyboard-selected menu item
 }
 
 #[derive(Clone, Copy)]
@@ -149,28 +152,49 @@ impl App {
             self.input.clear();
             return;
         }
-        let (to, body) = match text.strip_prefix('@') {
-            Some(rest) => match rest.split_once(' ') {
-                Some((name, msg)) => (Some(name.to_string()), msg.to_string()),
-                None => (None, text.clone()),
-            },
-            None => (None, text.clone()),
-        };
-        let payload = serde_json::json!({
-            "room": self.room, "name": self.name, "harness": "human-tui",
-            "machine": "tui", "body": body, "kind": "msg", "to": to,
-        });
-        match ureq::post(&format!("{}/ingest", self.hub))
-            .header("x-agora-token", &self.token)
-            .send_json(&payload)
-        {
-            Ok(_) => {
-                self.status = format!("sent{}", to.map(|t| format!(" → {t}")).unwrap_or_default());
-                self.input.clear();
-                self.refresh();
+        // leading @names (any number) = recipients; rest = body
+        let mut recipients: Vec<String> = Vec::new();
+        let mut body_words: Vec<&str> = Vec::new();
+        for word in text.split_whitespace() {
+            if body_words.is_empty() {
+                if let Some(n) = word.strip_prefix('@') {
+                    recipients.push(n.to_string());
+                    continue;
+                }
             }
-            Err(e) => self.status = format!("send failed: {e}"),
+            body_words.push(word);
         }
+        let body = body_words.join(" ");
+        if body.is_empty() {
+            self.status = "empty message".into();
+            return;
+        }
+        let targets: Vec<Option<String>> = if recipients.is_empty() {
+            vec![None]
+        } else {
+            recipients.iter().cloned().map(Some).collect()
+        };
+        let mut sent = 0;
+        for to in &targets {
+            let payload = serde_json::json!({
+                "room": self.room, "name": self.name, "harness": "human-tui",
+                "machine": "tui", "body": body, "kind": "msg", "to": to,
+            });
+            match ureq::post(&format!("{}/ingest", self.hub))
+                .header("x-agora-token", &self.token)
+                .send_json(&payload)
+            {
+                Ok(_) => sent += 1,
+                Err(e) => { self.status = format!("send failed: {e}"); return; }
+            }
+        }
+        self.status = if recipients.is_empty() {
+            "sent".into()
+        } else {
+            format!("sent → {} ({sent} DMs)", recipients.join(", "))
+        };
+        self.input.clear();
+        self.refresh();
     }
 
     fn fetch_rooms(&mut self) {
@@ -221,15 +245,17 @@ impl App {
                 })
                 .collect();
         }
-        // "@name" DM completion
-        if let Some(rest) = input.strip_prefix('@') {
-            if !rest.contains(' ') {
+        // "@name" DM completion on the last token (chains: "@a @b" both complete)
+        if input.starts_with('@') {
+            let last = input.rsplit(' ').next().unwrap_or("");
+            if let Some(rest) = last.strip_prefix('@') {
+                let prefix_done = &input[..input.len() - last.len()];
                 return self.peer_names().iter()
                     .filter(|n| n.starts_with(rest))
                     .map(|n| Suggestion {
-                        completed: format!("@{n} "),
+                        completed: format!("{prefix_done}@{n} "),
                         label: format!("@{n}"),
-                        desc: "send a DM".into(),
+                        desc: "add DM recipient".into(),
                         run: false,
                     })
                     .collect();
@@ -411,10 +437,11 @@ impl App {
             let idle = p["idle_secs"].as_i64().unwrap_or(0);
             let dot = if idle < 120 { Span::styled("● ", Style::default().fg(Color::Green)) }
                       else { Span::styled("○ ", Style::default().fg(Color::DarkGray)) };
-            let mut lines = vec![Line::from(vec![
-                dot,
-                Span::styled(name, Style::default().add_modifier(Modifier::BOLD)),
-            ])];
+            let mut first = vec![dot, Span::styled(name, Style::default().add_modifier(Modifier::BOLD))];
+            if self.peers_focused && self.peer_sel == idx && self.peer_menu.is_none() {
+                first.insert(0, Span::styled("▶", Style::default().fg(Color::White)));
+            }
+            let mut lines = vec![Line::from(first)];
             let sub = if status.is_empty() { harness } else { format!("{harness} · {status}") };
             if !sub.is_empty() {
                 lines.push(Line::from(Span::styled(format!("  {sub}"), Style::default().fg(Color::DarkGray))));
@@ -432,13 +459,14 @@ impl App {
                     ("  → move…", MenuAction::Move),
                     ("  ✕ close", MenuAction::Close),
                 ];
-                for (label, action) in items {
+                for (i, (label, action)) in items.into_iter().enumerate() {
                     if y >= area.y + area.height { break; }
                     let rect = Rect::new(area.x, y, area.width, 1);
                     self.menu_items.push((rect, action));
+                    let bg = if self.menu_sel == i { Color::Rgb(70, 76, 94) } else { Color::Rgb(40, 44, 56) };
                     out.push(Line::from(Span::styled(
                         label.to_string(),
-                        Style::default().fg(Color::Cyan).bg(Color::Rgb(40, 44, 56)),
+                        Style::default().fg(Color::Cyan).bg(bg),
                     )));
                     y += 1;
                 }
@@ -451,7 +479,17 @@ impl App {
         let Some(idx) = self.peer_menu.take() else { return };
         let Some(name) = self.peers.get(idx).and_then(|p| p["name"].as_str()).map(String::from) else { return };
         match action {
-            MenuAction::Message => self.input = format!("@{name} "),
+            MenuAction::Message => {
+                // append recipients: @a @b message
+                let trimmed = self.input.trim_start().to_string();
+                if trimmed.starts_with('@') && !self.input.contains(|c: char| c == ' ') || trimmed.split_whitespace().all(|w| w.starts_with('@')) && !trimmed.is_empty() {
+                    self.input = format!("{} @{name} ", trimmed.trim_end());
+                } else if trimmed.is_empty() {
+                    self.input = format!("@{name} ");
+                } else {
+                    self.input = format!("@{name} {trimmed}");
+                }
+            }
             MenuAction::Move => self.input = format!("/move {name} "),
             MenuAction::Kick => self.command(format!("kick {name}")),
             MenuAction::Close => {}
@@ -527,6 +565,7 @@ fn main() -> io::Result<()> {
         suggest_idx: 0, quit: false,
         rooms: vec![], peer_vis: vec![], peers_area: Rect::default(),
         peer_menu: None, menu_items: vec![],
+        peers_focused: false, peer_sel: 0, menu_sel: 0,
     };
     app.fetch_rooms();
     app.refresh();
@@ -562,14 +601,14 @@ fn main() -> io::Result<()> {
             f.render_widget(
                 Paragraph::new(timeline.clone()).block(
                     Block::default().borders(Borders::ALL).title(main_title)
-                        .border_style(Style::default().fg(gold)),
+                        .border_style(Style::default().fg(if app.peers_focused { Color::DarkGray } else { gold })),
                 ),
                 cols[0],
             );
 
             f.render_widget(
-                Block::default().borders(Borders::ALL).title(" peers (click for menu) ")
-                    .border_style(Style::default().fg(Color::DarkGray)),
+                Block::default().borders(Borders::ALL).title(" peers ")
+                    .border_style(Style::default().fg(if app.peers_focused { gold } else { Color::DarkGray })),
                 cols[1],
             );
             f.render_widget(Paragraph::new(peer_pane.clone()), peers_inner);
@@ -618,23 +657,41 @@ fn main() -> io::Result<()> {
             match event::read()? {
                 Event::Key(k) => {
                     let popup = !app.suggestions().is_empty();
+                    let menu_open = app.peer_menu.is_some();
                     match (k.code, k.modifiers) {
                         (KeyCode::Char('c'), KeyModifiers::CONTROL) => break Ok(()),
                         (KeyCode::Char('q'), m) if app.input.is_empty() && m.is_empty() => break Ok(()),
+                        (KeyCode::Left, _) | (KeyCode::Right, _) if !popup => {
+                            app.peers_focused = !app.peers_focused;
+                            app.peer_menu = None;
+                        }
                         (KeyCode::Tab, _) if popup => { app.complete_suggestion(); }
                         (KeyCode::Tab, _) => { app.show_feed = !app.show_feed; app.selected = None; }
-                        (KeyCode::Enter, _) if popup => { app.complete_suggestion(); }
-                        (KeyCode::Enter, _) => app.send(),
-                        (KeyCode::Up, _) if popup => {
-                            app.suggest_idx = app.suggest_idx.saturating_sub(1);
+                        (KeyCode::Enter, _) if menu_open => {
+                            let action = app.menu_items.get(app.menu_sel).map(|&(_, a)| a);
+                            if let Some(a) = action { app.menu_action(a); }
                         }
+                        (KeyCode::Enter, _) if popup => { app.complete_suggestion(); }
+                        (KeyCode::Enter, _) if app.peers_focused => {
+                            app.peer_menu = Some(app.peer_sel.min(app.peers.len().saturating_sub(1)));
+                            app.menu_sel = 0;
+                        }
+                        (KeyCode::Enter, _) => app.send(),
+                        (KeyCode::Up, _) if menu_open => app.menu_sel = app.menu_sel.saturating_sub(1),
+                        (KeyCode::Down, _) if menu_open => app.menu_sel = (app.menu_sel + 1).min(3),
+                        (KeyCode::Up, _) if popup => app.suggest_idx = app.suggest_idx.saturating_sub(1),
                         (KeyCode::Down, _) if popup => {
                             app.suggest_idx = (app.suggest_idx + 1).min(app.suggestions().len().saturating_sub(1));
+                        }
+                        (KeyCode::Up, _) if app.peers_focused => app.peer_sel = app.peer_sel.saturating_sub(1),
+                        (KeyCode::Down, _) if app.peers_focused => {
+                            app.peer_sel = (app.peer_sel + 1).min(app.peers.len().saturating_sub(1));
                         }
                         (KeyCode::Up, _) => app.select_move(-1),
                         (KeyCode::Down, _) => app.select_move(1),
                         (KeyCode::Esc, _) => {
                             if app.peer_menu.is_some() { app.peer_menu = None; }
+                            else if app.peers_focused { app.peers_focused = false; }
                             else if app.input.is_empty() { app.selected = None; }
                             else { app.input.clear(); }
                         }
