@@ -90,11 +90,17 @@ fn main() {
             let yolo = std::env::var("AGORA_YOLO").is_ok_and(|v| v == "1");
             let bin = match harness.as_str() {
                 "claude" | "claude-code" => {
-                    let p = if yolo { "--dangerously-skip-permissions" } else { "--permission-mode acceptEdits" };
+                    // Scoped permission (not a blanket bypass): allowlist ONLY the
+                    // agora MCP tools a resident agent needs, so its join/inbox/post
+                    // calls run unattended while everything else still prompts.
+                    // AGORA_YOLO=1 upgrades to full skip for do-anything workers.
+                    let p = if yolo {
+                        "--dangerously-skip-permissions".to_string()
+                    } else {
+                        "--permission-mode acceptEdits --allowedTools \"mcp__agora__join_room\" \"mcp__agora__inbox\" \"mcp__agora__post\" \"mcp__agora__peers\" \"mcp__agora__set_status\" \"mcp__agora__wait_for_messages\" \"mcp__agora__feed\" \"Write\"".to_string()
+                    };
                     // strict-mcp-config: load ONLY agora-mcp.json (written below),
-                    // ignoring project/global MCP configs — a resident agent needs
-                    // only the agora tools, and this skips the "new MCP servers
-                    // found, approve?" onboarding prompt that stalls a headless spawn.
+                    // ignoring project/global MCP configs.
                     format!("claude {p} --strict-mcp-config --mcp-config agora-mcp.json{m}")
                 }
                 "codex" => {
