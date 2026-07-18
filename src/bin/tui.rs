@@ -47,6 +47,7 @@ struct App {
     feed: Vec<serde_json::Value>,
     peers: Vec<serde_json::Value>,
     input: String,
+    cursor: usize, // char index into input
     status: String,
     show_feed: bool,
     expanded: HashSet<String>,   // keys of expanded messages ("m:<id>" / "f:<id>")
@@ -159,6 +160,58 @@ impl App {
         }
     }
 
+    // --- text editing (cursor in char units) ---
+    fn set_input(&mut self, s: String) {
+        self.cursor = s.chars().count();
+        self.input = s;
+    }
+    fn clear_input(&mut self) {
+        self.input.clear();
+        self.cursor = 0;
+        self.suggest_idx = 0;
+    }
+    fn insert_char(&mut self, c: char) {
+        let byte = self.input.char_indices().nth(self.cursor).map(|(b, _)| b).unwrap_or(self.input.len());
+        self.input.insert(byte, c);
+        self.cursor += 1;
+        self.suggest_idx = 0;
+    }
+    fn backspace(&mut self) {
+        if self.cursor == 0 { return; }
+        let byte = self.input.char_indices().nth(self.cursor - 1).map(|(b, _)| b).unwrap();
+        self.input.remove(byte);
+        self.cursor -= 1;
+        self.suggest_idx = 0;
+    }
+    fn delete(&mut self) {
+        if self.cursor >= self.input.chars().count() { return; }
+        let byte = self.input.char_indices().nth(self.cursor).map(|(b, _)| b).unwrap();
+        self.input.remove(byte);
+    }
+    fn move_left(&mut self) { self.cursor = self.cursor.saturating_sub(1); }
+    fn move_right(&mut self) { self.cursor = (self.cursor + 1).min(self.input.chars().count()); }
+    fn home(&mut self) { self.cursor = 0; }
+    fn end(&mut self) { self.cursor = self.input.chars().count(); }
+    fn word_left(&mut self) {
+        let ch: Vec<char> = self.input.chars().collect();
+        while self.cursor > 0 && ch[self.cursor - 1].is_whitespace() { self.cursor -= 1; }
+        while self.cursor > 0 && !ch[self.cursor - 1].is_whitespace() { self.cursor -= 1; }
+    }
+    fn word_right(&mut self) {
+        let ch: Vec<char> = self.input.chars().collect();
+        let n = ch.len();
+        while self.cursor < n && ch[self.cursor].is_whitespace() { self.cursor += 1; }
+        while self.cursor < n && !ch[self.cursor].is_whitespace() { self.cursor += 1; }
+    }
+    fn delete_word(&mut self) {
+        let start = self.cursor;
+        self.word_left();
+        let ch: Vec<char> = self.input.chars().collect();
+        let kept: String = ch[..self.cursor].iter().chain(ch[start..].iter()).collect();
+        self.input = kept;
+        self.suggest_idx = 0;
+    }
+
     fn send(&mut self) {
         let text = self.input.trim().to_string();
         if text.is_empty() {
@@ -214,7 +267,7 @@ impl App {
         } else {
             format!("sent → {} ({sent} DMs)", recipients.join(", "))
         };
-        self.input.clear();
+        self.clear_input();
         self.refresh();
     }
 
@@ -331,10 +384,10 @@ impl App {
         };
         if s.run {
             let cmd = s.completed.trim_start_matches('/').to_string();
-            self.input.clear();
+            self.clear_input();
             self.command(cmd);
         } else {
-            self.input = s.completed.clone();
+            self.set_input(s.completed.clone());
         }
         true
     }
@@ -662,14 +715,14 @@ impl App {
                 // append recipients: @a @b message
                 let trimmed = self.input.trim_start().to_string();
                 if trimmed.starts_with('@') && !self.input.contains(|c: char| c == ' ') || trimmed.split_whitespace().all(|w| w.starts_with('@')) && !trimmed.is_empty() {
-                    self.input = format!("{} @{name} ", trimmed.trim_end());
+                    self.set_input(format!("{} @{name} ", trimmed.trim_end()));
                 } else if trimmed.is_empty() {
-                    self.input = format!("@{name} ");
+                    self.set_input(format!("@{name} "));
                 } else {
-                    self.input = format!("@{name} {trimmed}");
+                    self.set_input(format!("@{name} {trimmed}"));
                 }
             }
-            MenuAction::Move => self.input = format!("/move {name} "),
+            MenuAction::Move => self.set_input(format!("/move {name} ")),
             MenuAction::Kick => self.command(format!("kick {name}")),
             MenuAction::Close => {}
         }
@@ -759,7 +812,7 @@ fn main() -> io::Result<()> {
     let mut app = App {
         hub, room, name, token,
         messages: vec![], feed: vec![], peers: vec![],
-        input: String::new(), status: String::new(), show_feed: false,
+        input: String::new(), cursor: 0, status: String::new(), show_feed: false,
         expanded: HashSet::new(), selected: None, vis: vec![], msg_area: Rect::default(),
         suggest_idx: 0, quit: false,
         rooms: vec![], peer_vis: vec![], peers_area: Rect::default(),
@@ -857,8 +910,9 @@ fn main() -> io::Result<()> {
                 f.render_widget(ratatui::widgets::Clear, area);
                 f.render_widget(Paragraph::new(clip_row(&sig, &desc)), area);
             }
+            // cursor sits at its char position within the input box
             f.set_cursor_position((
-                outer[1].x + 1 + app.input.chars().count() as u16,
+                outer[1].x + 1 + app.cursor as u16,
                 outer[1].y + 1,
             ));
         })?;
@@ -868,12 +922,32 @@ fn main() -> io::Result<()> {
                 Event::Key(k) => {
                     let popup = !app.suggestions().is_empty();
                     let menu_open = app.peer_menu.is_some();
+                    let alt = k.modifiers.contains(KeyModifiers::ALT);
+                    let _ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+                    // Cmd (Super) on macOS is usually swallowed by the terminal;
+                    // we accept it if it arrives, mapped to line-start/end.
+                    let cmd = k.modifiers.contains(KeyModifiers::SUPER);
                     match (k.code, k.modifiers) {
                         (KeyCode::Char('c'), KeyModifiers::CONTROL) => break Ok(()),
                         (KeyCode::Char('q'), m) if app.input.is_empty() && m.is_empty() => break Ok(()),
-                        // arrows only navigate when the input is empty, so they
-                        // don't fire while composing a message
-                        (KeyCode::Left, _) | (KeyCode::Right, _) if !popup && app.input.is_empty() => {
+                        // --- text cursor navigation (only when input has text) ---
+                        (KeyCode::Left, _) if !app.input.is_empty() && (alt || cmd) => {
+                            if cmd { app.home(); } else { app.word_left(); }
+                        }
+                        (KeyCode::Right, _) if !app.input.is_empty() && (alt || cmd) => {
+                            if cmd { app.end(); } else { app.word_right(); }
+                        }
+                        (KeyCode::Left, _) if !app.input.is_empty() => app.move_left(),
+                        (KeyCode::Right, _) if !app.input.is_empty() => app.move_right(),
+                        (KeyCode::Char('a'), KeyModifiers::CONTROL) => app.home(),
+                        (KeyCode::Char('e'), KeyModifiers::CONTROL) => app.end(),
+                        (KeyCode::Char('w'), KeyModifiers::CONTROL) => app.delete_word(),
+                        (KeyCode::Char('u'), KeyModifiers::CONTROL) => app.clear_input(),
+                        (KeyCode::Home, _) => app.home(),
+                        (KeyCode::End, _) => app.end(),
+                        (KeyCode::Delete, _) => app.delete(),
+                        // --- empty input: arrows navigate panes/lists ---
+                        (KeyCode::Left, _) | (KeyCode::Right, _) if !popup => {
                             app.peers_focused = !app.peers_focused;
                             app.peer_menu = None;
                         }
@@ -895,22 +969,22 @@ fn main() -> io::Result<()> {
                         (KeyCode::Down, _) if popup => {
                             app.suggest_idx = (app.suggest_idx + 1).min(app.suggestions().len().saturating_sub(1));
                         }
-                        (KeyCode::Up, _) if app.peers_focused => app.peer_sel = app.peer_sel.saturating_sub(1),
-                        (KeyCode::Down, _) if app.peers_focused => {
+                        (KeyCode::Up, _) if app.peers_focused && app.input.is_empty() => app.peer_sel = app.peer_sel.saturating_sub(1),
+                        (KeyCode::Down, _) if app.peers_focused && app.input.is_empty() => {
                             app.peer_sel = (app.peer_sel + 1).min(app.peers.len().saturating_sub(1));
                         }
-                        (KeyCode::Up, _) => app.select_move(-1),
-                        (KeyCode::Down, _) => app.select_move(1),
+                        (KeyCode::Up, _) if app.input.is_empty() => app.select_move(-1),
+                        (KeyCode::Down, _) if app.input.is_empty() => app.select_move(1),
                         (KeyCode::Esc, _) => {
                             if app.peer_menu.is_some() { app.peer_menu = None; }
                             else if app.peers_focused { app.peers_focused = false; }
                             else if app.input.is_empty() { app.selected = None; }
-                            else { app.input.clear(); }
+                            else { app.clear_input(); }
                         }
-                        (KeyCode::Backspace, _) => { app.input.pop(); app.suggest_idx = 0; }
+                        (KeyCode::Backspace, _) if alt => app.delete_word(),
+                        (KeyCode::Backspace, _) => app.backspace(),
                         (KeyCode::Char(c), m) if m.is_empty() || m == KeyModifiers::SHIFT => {
-                            app.input.push(c);
-                            app.suggest_idx = 0;
+                            app.insert_char(c);
                         }
                         _ => {}
                     }
