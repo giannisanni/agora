@@ -69,6 +69,7 @@ struct App {
 enum MenuAction {
     Message,
     Reveal,
+    Restart,
     Kick,
     Move,
     Close,
@@ -552,34 +553,37 @@ impl App {
         self.peer_vis.clear();
         self.menu_items.clear();
         let w = area.width as usize;
-        // clip to panel width so nothing overflows the border
-        let clip = |s: &str, reserve: usize| -> String {
-            let max = w.saturating_sub(reserve + 1); // +1 = right margin before border
-            if s.chars().count() <= max { s.to_string() }
-            else { s.chars().take(max.saturating_sub(1)).collect::<String>() + "…" }
-        };
         let mut out: Vec<Line> = Vec::new();
         let mut y = area.y;
         for (idx, p) in self.peers.iter().enumerate() {
             let name = p["name"].as_str().unwrap_or("?").to_string();
             let harness = p["harness"].as_str().unwrap_or("").to_string();
             let harness = if harness.is_empty() { "unknown".to_string() } else { harness };
-            let status = p["status"].as_str().unwrap_or("").to_string();
             let idle = p["idle_secs"].as_i64().unwrap_or(0);
-            let dot = if idle < 120 { Span::styled("● ", Style::default().fg(Color::Green)) }
-                      else { Span::styled("○ ", Style::default().fg(Color::DarkGray)) };
-            // ● + optional ▶ marker take ~2-3 cols
+            // state by idle: parked resident pings every 1s (green); idle (yellow);
+            // stale/likely-dead (red). Color replaces the long status text.
+            let (dot_color, sel_color) = if idle < 90 { (Color::Green, Color::Green) }
+                else if idle < 600 { (Color::Yellow, Color::Yellow) }
+                else { (Color::Red, Color::Red) };
             let sel = self.peers_focused && self.peer_sel == idx && self.peer_menu.is_none();
-            let name_reserve = if sel { 4 } else { 2 };
-            let mut first = vec![dot, Span::styled(clip(&name, name_reserve), Style::default().add_modifier(Modifier::BOLD))];
-            if sel {
-                first.insert(0, Span::styled("▶", Style::default().fg(Color::White)));
+            // name wraps to continuation lines (dot only on the first), no clipping
+            let indent = if sel { 4 } else { 2 };
+            let wrapped = wrap_text(&name, w.saturating_sub(indent + 1));
+            let mut lines: Vec<Line> = Vec::new();
+            for (li, chunk) in wrapped.iter().enumerate() {
+                let mut spans = Vec::new();
+                if li == 0 {
+                    if sel { spans.push(Span::styled("▶", Style::default().fg(Color::White))); }
+                    spans.push(Span::styled("● ", Style::default().fg(dot_color)));
+                } else {
+                    spans.push(Span::raw(if sel { "    " } else { "  " }.to_string()));
+                }
+                spans.push(Span::styled(chunk.clone(), Style::default().add_modifier(Modifier::BOLD)));
+                lines.push(Line::from(spans));
             }
-            let mut lines = vec![Line::from(first)];
-            let sub = if status.is_empty() { harness } else { format!("{harness} · {status}") };
-            if !sub.is_empty() {
-                lines.push(Line::from(Span::styled(format!("  {}", clip(&sub, 3)), Style::default().fg(Color::DarkGray))));
-            }
+            let _ = sel_color;
+            // sub-line: harness only (short); state is in the dot color
+            lines.push(Line::from(Span::styled(format!("  {harness}"), Style::default().fg(Color::DarkGray))));
             let h = lines.len() as u16;
             if y + h > area.y + area.height { break; }
             self.peer_vis.push((idx, y, h));
@@ -587,9 +591,10 @@ impl App {
             y += h;
             // context menu under the open peer
             if self.peer_menu == Some(idx) {
-                let items: [(&str, MenuAction); 5] = [
+                let items: [(&str, MenuAction); 6] = [
                     ("  ✉ message", MenuAction::Message),
                     ("  ⤒ reveal", MenuAction::Reveal),
+                    ("  ↻ restart", MenuAction::Restart),
                     ("  ✂ kick", MenuAction::Kick),
                     ("  → move…", MenuAction::Move),
                     ("  ✕ close", MenuAction::Close),
@@ -614,6 +619,9 @@ impl App {
         let Some(idx) = self.peer_menu.take() else { return };
         let Some(name) = self.peers.get(idx).and_then(|p| p["name"].as_str()).map(String::from) else { return };
         match action {
+            MenuAction::Restart => {
+                self.orch(&["restart".to_string(), name.clone()]);
+            }
             MenuAction::Reveal => {
                 let id = self.peers.get(idx).and_then(|p| p["id"].as_i64()).unwrap_or(-1);
                 let bin = format!("{}/workspace/agora/target/release/wake", std::env::var("HOME").unwrap_or_default());
@@ -841,7 +849,7 @@ fn main() -> io::Result<()> {
                         }
                         (KeyCode::Enter, _) => app.send(),
                         (KeyCode::Up, _) if menu_open => app.menu_sel = app.menu_sel.saturating_sub(1),
-                        (KeyCode::Down, _) if menu_open => app.menu_sel = (app.menu_sel + 1).min(4),
+                        (KeyCode::Down, _) if menu_open => app.menu_sel = (app.menu_sel + 1).min(5),
                         (KeyCode::Up, _) if popup => app.suggest_idx = app.suggest_idx.saturating_sub(1),
                         (KeyCode::Down, _) if popup => {
                             app.suggest_idx = (app.suggest_idx + 1).min(app.suggestions().len().saturating_sub(1));
