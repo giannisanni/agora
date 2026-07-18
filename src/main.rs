@@ -220,6 +220,26 @@ impl Db {
         Ok(rows)
     }
 
+    // peek without consuming: how many inbox-class messages await this agent
+    fn unread_count(&self, agent_id: i64) -> Result<i64, AgoraErr> {
+        let conn = self.0.lock().unwrap();
+        let (room, name, cursor): (String, String, i64) = conn.query_row(
+            "SELECT room, name, cursor FROM agents WHERE id = ?1",
+            [agent_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        let n = conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM messages
+                 WHERE room = ?1 AND id > ?2 AND sender != ?3 AND kind NOT IN ({FEED_KINDS})
+                   AND (recipient IS NULL OR recipient = ?3)"
+            ),
+            (&room, cursor, &name),
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
     // feed reads never touch cursors: ambient visibility is pull-on-demand
     fn feed(&self, room: &str, from: Option<&str>, limit: i64) -> rusqlite::Result<Vec<serde_json::Value>> {
         let conn = self.0.lock().unwrap();
@@ -465,6 +485,29 @@ struct IngestReq {
     source_id: Option<String>,
 }
 
+// non-consuming unread count, for turn-boundary hooks ("should I check inbox
+// before going idle?"). Same shared secret as /ingest.
+async fn unread(
+    axum::extract::State(db): axum::extract::State<Arc<Db>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    use axum::http::StatusCode;
+    let expected = std::env::var("AGORA_INGEST_TOKEN").unwrap_or_default();
+    let given = headers.get("x-agora-token").and_then(|v| v.to_str().ok()).unwrap_or("");
+    if expected.is_empty() || given != expected {
+        return Err((StatusCode::FORBIDDEN, "bad or missing x-agora-token".into()));
+    }
+    let agent_id: i64 = q
+        .get("agent_id")
+        .and_then(|s| s.parse().ok())
+        .ok_or((StatusCode::BAD_REQUEST, "agent_id required".into()))?;
+    let n = db
+        .unread_count(agent_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}")))?;
+    Ok(axum::Json(json!({ "unread": n })))
+}
+
 // plain HTTP door for the scribe daemon, gated by a shared secret
 async fn ingest(
     axum::extract::State(db): axum::extract::State<Arc<Db>>,
@@ -513,6 +556,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let router = axum::Router::new()
         .route("/ingest", axum::routing::post(ingest))
+        .route("/unread", axum::routing::get(unread))
         .with_state(db_state)
         .nest_service("/mcp", service);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
