@@ -80,12 +80,23 @@ fn main() {
             // each harness otherwise uses its own configured default model.
             let m = model.as_deref().map(|m| format!(" --model {m}")).unwrap_or_default();
             let m_codex = model.as_deref().map(|m| format!(" -m {m}")).unwrap_or_default();
-            // non-interactive launch flags so first-run trust/permission
-            // prompts don't block a headless (esp. remote) spawn.
+            // Non-interactive launch so first-run trust/permission prompts don't
+            // block a headless (esp. remote) spawn. Default: acceptEdits — the
+            // agent proceeds without prompting for edits but still refuses/asks
+            // on higher-risk actions. Full sandbox/permission bypass is OFF by
+            // default and only enabled with AGORA_YOLO=1, an explicit operator
+            // opt-in (spawned agents run with the host user's credentials, so a
+            // blanket bypass = arbitrary host command execution — see README).
+            let yolo = std::env::var("AGORA_YOLO").is_ok_and(|v| v == "1");
             let bin = match harness.as_str() {
-                "claude" | "claude-code" =>
-                    format!("claude --permission-mode acceptEdits --dangerously-skip-permissions{m}"),
-                "codex" => format!("codex --dangerously-bypass-approvals-and-sandbox{m_codex}"),
+                "claude" | "claude-code" => {
+                    let p = if yolo { "--dangerously-skip-permissions" } else { "--permission-mode acceptEdits" };
+                    format!("claude {p}{m}")
+                }
+                "codex" => {
+                    let p = if yolo { "--dangerously-bypass-approvals-and-sandbox" } else { "--full-auto" };
+                    format!("codex {p}{m_codex}")
+                }
                 "opencode" => format!("opencode run{m}"),
                 other => other.to_string(),
             };
