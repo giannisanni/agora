@@ -686,6 +686,8 @@ struct IngestReq {
     source_id: Option<String>,
     #[serde(default)]
     to: Option<String>,
+    #[serde(default)]
+    mirror: bool,
 }
 
 fn check_token(headers: &axum::http::HeaderMap) -> Result<(), (axum::http::StatusCode, String)> {
@@ -942,7 +944,7 @@ async fn ingest(
         AgoraErr::NoSuchPeer(n) => (StatusCode::BAD_REQUEST, format!("no agent named '{n}' in this room")),
     };
     let (agent_id, _) = db.join(&req.room, &req.name, &req.harness, &req.machine, "owner").map_err(err)?;
-    db.set_mirror(&req.room, &req.name);
+    if req.mirror { db.set_mirror(&req.room, &req.name); }
     let (id, new) = db
         .post(agent_id, "owner", &req.body, req.to.as_deref(), req.kind.as_deref().unwrap_or("summary"), req.source_id.as_deref())
         .map_err(err)?;

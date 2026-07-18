@@ -200,6 +200,7 @@ fn mirror(
             "room": room,
             "name": name,
             "harness": "scribe",
+            "mirror": true,
             "machine": machine,
             "body": body,
             "kind": "summary",

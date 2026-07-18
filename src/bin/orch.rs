@@ -13,6 +13,11 @@
 
 use std::process::Command;
 
+/// Single-quote a string for safe embedding in a shell command.
+fn sh_squote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 fn run(host: Option<&str>, script: &str) -> (bool, String) {
     let out = match host {
         Some(h) => Command::new("ssh").args([h, script]).output(),
@@ -77,21 +82,34 @@ fn main() {
                 "opencode" => format!("opencode run{m}"),
                 other => other.to_string(),
             };
-            let prompt = join_prompt(&name, &room, &harness).replace('"', "\\\"");
+            let prompt = join_prompt(&name, &room, &harness);
+            // self-healing wrapper: if the agent process exits (turn ends /
+            // crashes), restart it after a short backoff — keeps the agent
+            // resident and the tmux session (and server) alive. `.agora-stop`
+            // breaks the loop for a clean kill.
+            let run_sh = format!(
+                "#!/bin/bash\ncd \"$(dirname \"$0\")\"\nwhile [ ! -f .agora-stop ]; do\n  {bin} \"$(cat prompt.txt)\"\n  [ -f .agora-stop ] && break\n  sleep 5\ndone\n"
+            );
             let script = format!(
                 "mkdir -p ~/agora-agents/{name} && cd ~/agora-agents/{name} && \
                  printf '%s %s\\n' '{harness}' '{room}' > .agora-spawn && \
-                 tmux new-session -d -s agora-{name} \"{bin} \\\"{prompt}\\\"\" && \
-                 echo spawned agora-{name}"
+                 rm -f .agora-stop && \
+                 printf '%s' {prompt_q} > prompt.txt && \
+                 printf '%s' {run_q} > run.sh && \
+                 tmux new-session -d -s agora-{name} 'bash run.sh' && \
+                 echo spawned agora-{name}",
+                prompt_q = sh_squote(&prompt),
+                run_q = sh_squote(&run_sh),
             );
             let (ok, out) = run(host, &script);
             print!("{out}");
             std::process::exit(if ok { 0 } else { 1 });
         }
         "kill" => {
-            // also drop the id-file so a reused agent_id can't mis-map reveal/wake
+            // set the stop flag first so the respawn loop won't relaunch, then
+            // kill the session; drop the id-file so a reused id can't mis-map.
             let (ok, out) = run(host, &format!(
-                "tmux kill-session -t agora-{name}; rm -f ~/agora-agents/{name}/.agora-agent-id; echo killed agora-{name}"
+                "touch ~/agora-agents/{name}/.agora-stop 2>/dev/null; tmux kill-session -t agora-{name}; rm -f ~/agora-agents/{name}/.agora-agent-id; echo killed agora-{name}"
             ));
             print!("{out}");
             std::process::exit(if ok { 0 } else { 1 });
