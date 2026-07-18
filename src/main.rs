@@ -392,6 +392,16 @@ impl Db {
         Ok(n)
     }
 
+    /// Backdate last_seen so a just-killed agent shows stale (red) immediately
+    /// instead of drifting for ~2min on its final ping. Also clears status.
+    fn mark_stale(&self, room: &str, name: &str) -> rusqlite::Result<usize> {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "UPDATE agents SET last_seen = unixepoch() - 100000, status = '(stopped)' WHERE room = ?1 AND name = ?2",
+            (room, name),
+        )
+    }
+
     // observer view for the TUI: recent inbox-class traffic, no cursor effects
     fn recent_messages(&self, room: &str, limit: i64) -> rusqlite::Result<Vec<serde_json::Value>> {
         let conn = self.0.lock().unwrap();
@@ -815,6 +825,24 @@ async fn http_kick(
     Ok(axum::Json(json!({ "kicked": n })))
 }
 
+#[derive(serde::Deserialize)]
+struct StaleReq {
+    room: String,
+    name: String,
+}
+
+async fn http_stale(
+    axum::extract::State(db): axum::extract::State<Arc<Db>>,
+    headers: axum::http::HeaderMap,
+    axum::Json(req): axum::Json<StaleReq>,
+) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    check_token(&headers)?;
+    let n = db
+        .mark_stale(&req.room, &req.name)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(axum::Json(json!({ "updated": n })))
+}
+
 // idle agents with unread mail, for the wake shim
 async fn http_wakeable(
     axum::extract::State(db): axum::extract::State<Arc<Db>>,
@@ -983,6 +1011,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/rooms", axum::routing::get(http_rooms))
         .route("/move", axum::routing::post(http_move))
         .route("/kick", axum::routing::post(http_kick))
+        .route("/stale", axum::routing::post(http_stale))
         .route("/delroom", axum::routing::post(http_delroom))
         .route("/usage", axum::routing::get(http_usage_get).post(http_usage_post))
         .route("/heartbeat", axum::routing::post(http_heartbeat))
