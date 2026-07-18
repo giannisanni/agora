@@ -39,9 +39,12 @@ impl Db {
                 sender TEXT NOT NULL,
                 recipient TEXT,
                 body TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'msg',
                 created INTEGER DEFAULT (unixepoch())
             );",
         )?;
+        // lazy migration for pre-kind dbs; harmless error if column exists
+        let _ = conn.execute("ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL DEFAULT 'msg'", []);
         Ok(Self(Mutex::new(conn)))
     }
 
@@ -69,7 +72,7 @@ impl Db {
         Ok((id, backlog))
     }
 
-    fn post(&self, agent_id: i64, text: &str, to: Option<&str>) -> rusqlite::Result<i64> {
+    fn post(&self, agent_id: i64, text: &str, to: Option<&str>, kind: &str) -> rusqlite::Result<i64> {
         let conn = self.0.lock().unwrap();
         let (room, name): (String, String) = conn.query_row(
             "SELECT room, name FROM agents WHERE id = ?1",
@@ -77,8 +80,8 @@ impl Db {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         conn.execute(
-            "INSERT INTO messages(room, sender, recipient, body) VALUES(?1, ?2, ?3, ?4)",
-            (&room, &name, to, text),
+            "INSERT INTO messages(room, sender, recipient, body, kind) VALUES(?1, ?2, ?3, ?4, ?5)",
+            (&room, &name, to, text, kind),
         )?;
         let id = conn.last_insert_rowid();
         Self::touch(&conn, agent_id);
@@ -107,7 +110,7 @@ impl Db {
     fn messages_after(conn: &Connection, room: &str, me: &str, after: i64, limit: Option<i64>) -> rusqlite::Result<Vec<serde_json::Value>> {
         let mut stmt = conn.prepare(
             "SELECT id, sender, recipient, body, created FROM messages
-             WHERE room = ?1 AND id > ?2 AND sender != ?3
+             WHERE room = ?1 AND id > ?2 AND sender != ?3 AND kind = 'msg'
                AND (recipient IS NULL OR recipient = ?3)
              ORDER BY id DESC LIMIT ?4",
         )?;
@@ -143,6 +146,28 @@ impl Db {
                 }))
             })?
             .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    // feed reads never touch cursors: ambient visibility is pull-on-demand
+    fn feed(&self, room: &str, from: Option<&str>, limit: i64) -> rusqlite::Result<Vec<serde_json::Value>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, sender, body, created FROM messages
+             WHERE room = ?1 AND kind = 'feed' AND (?2 IS NULL OR sender = ?2)
+             ORDER BY id DESC LIMIT ?3",
+        )?;
+        let mut rows: Vec<serde_json::Value> = stmt
+            .query_map((room, from, limit), |r| {
+                Ok(json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "from": r.get::<_, String>(1)?,
+                    "body": r.get::<_, String>(2)?,
+                    "at": r.get::<_, i64>(3)?,
+                }))
+            })?
+            .collect::<Result<_, _>>()?;
+        rows.reverse();
         Ok(rows)
     }
 
@@ -184,6 +209,27 @@ struct PostParams {
     text: String,
     /// Optional recipient agent name for a targeted message; omit to broadcast
     to: Option<String>,
+    /// "msg" (default, delivered via inbox) or "feed" (ambient activity, read via feed tool only)
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct FeedParams {
+    /// Room name
+    room: String,
+    /// Only entries from this agent name
+    from: Option<String>,
+    /// Max entries (default 20)
+    limit: Option<i64>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct WaitParams {
+    /// Your agent id from join_room
+    agent_id: i64,
+    /// Seconds to wait for a message before returning empty (default 60, max 300)
+    timeout_secs: Option<u64>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -224,10 +270,34 @@ impl Agora {
         Ok(ok_json(json!({ "agent_id": id, "backlog": backlog })))
     }
 
-    #[tool(description = "Post a message to your room. Broadcast by default; set `to` for a targeted message.")]
+    #[tool(description = "Post a message to your room. Broadcast by default; set `to` for a targeted message. kind=feed for ambient activity updates.")]
     fn post(&self, Parameters(p): Parameters<PostParams>) -> Result<CallToolResult, McpError> {
-        let id = self.db.post(p.agent_id, &p.text, p.to.as_deref()).map_err(db_err)?;
+        let kind = match p.kind.as_deref() {
+            None | Some("msg") => "msg",
+            Some("feed") => "feed",
+            Some(other) => return Err(McpError::invalid_params(format!("unknown kind: {other}"), None)),
+        };
+        let id = self.db.post(p.agent_id, &p.text, p.to.as_deref(), kind).map_err(db_err)?;
         Ok(ok_json(json!({ "message_id": id })))
+    }
+
+    #[tool(description = "Read recent ambient activity (kind=feed) from a room, optionally filtered to one agent. Never consumes inbox state; call only when you want to catch up on what peers are doing.")]
+    fn feed(&self, Parameters(p): Parameters<FeedParams>) -> Result<CallToolResult, McpError> {
+        let entries = self.db.feed(&p.room, p.from.as_deref(), p.limit.unwrap_or(20)).map_err(db_err)?;
+        Ok(ok_json(json!({ "feed": entries })))
+    }
+
+    #[tool(description = "Block until a message arrives for you (or timeout), then return it like inbox. Terminal-agnostic wake: call this when idle and waiting for another agent.")]
+    async fn wait_for_messages(&self, Parameters(p): Parameters<WaitParams>) -> Result<CallToolResult, McpError> {
+        let timeout = p.timeout_secs.unwrap_or(60).min(300);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+        loop {
+            let msgs = self.db.inbox(p.agent_id).map_err(db_err)?;
+            if !msgs.is_empty() || std::time::Instant::now() >= deadline {
+                return Ok(ok_json(json!({ "messages": msgs })));
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
     }
 
     #[tool(description = "Fetch messages you have not seen yet (each message is delivered exactly once). Call at the start of every turn.")]
@@ -307,7 +377,7 @@ mod tests {
         let (a, _) = db.join("r", "alice", "", "").unwrap();
         let (b, _) = db.join("r", "bob", "", "").unwrap();
 
-        db.post(a, "hi bob", None).unwrap();
+        db.post(a, "hi bob", None, "msg").unwrap();
         let got = db.inbox(b).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0]["body"], "hi bob");
@@ -324,7 +394,7 @@ mod tests {
         let (b, _) = db.join("r", "bob", "", "").unwrap();
         let (c, _) = db.join("r", "carol", "", "").unwrap();
 
-        db.post(a, "for bob only", Some("bob")).unwrap();
+        db.post(a, "for bob only", Some("bob"), "msg").unwrap();
         assert_eq!(db.inbox(b).unwrap().len(), 1);
         assert!(db.inbox(c).unwrap().is_empty());
         // carol's cursor advanced past the filtered message; nothing re-delivers later
@@ -336,9 +406,9 @@ mod tests {
         let db = mem();
         let (a, _) = db.join("r", "alice", "", "").unwrap();
         let (b, _) = db.join("r", "bob", "", "").unwrap();
-        db.post(a, "one", None).unwrap();
+        db.post(a, "one", None, "msg").unwrap();
         assert_eq!(db.inbox(b).unwrap().len(), 1);
-        db.post(a, "two", None).unwrap();
+        db.post(a, "two", None, "msg").unwrap();
 
         // bob rejoins (new session): same id preserved, cursor intact,
         // inbox still delivers only the unseen "two"
@@ -348,6 +418,28 @@ mod tests {
         let got = db.inbox(b).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0]["body"], "two");
+    }
+
+    #[test]
+    fn feed_is_ambient_not_inbox() {
+        let db = mem();
+        let (a, _) = db.join("r", "alice", "", "").unwrap();
+        let (b, _) = db.join("r", "bob", "", "").unwrap();
+
+        db.post(a, "turn 1: refactoring auth", None, "feed").unwrap();
+        db.post(a, "hey bob, need review", None, "msg").unwrap();
+
+        // inbox delivers only the msg, never feed entries
+        let got = db.inbox(b).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0]["body"], "hey bob, need review");
+
+        // feed returns ambient entries, repeatably (no cursor consumption)
+        for _ in 0..2 {
+            let f = db.feed("r", Some("alice"), 20).unwrap();
+            assert_eq!(f.len(), 1);
+            assert_eq!(f[0]["body"], "turn 1: refactoring auth");
+        }
     }
 
     #[test]
