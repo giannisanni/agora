@@ -111,10 +111,22 @@ fn main() {
             let run_sh = format!(
                 "#!/bin/bash\ncd \"$(dirname \"$0\")\"\nb=5\nwhile [ ! -f .agora-stop ]; do\n  s=$SECONDS\n  {bin} \"$(cat prompt.txt)\"\n  [ -f .agora-stop ] && break\n  if [ $((SECONDS - s)) -ge 60 ]; then b=5; else b=$((b*2)); [ $b -gt 300 ] && b=300; fi\n  echo \"[agora] agent exited; restarting in ${{b}}s\"\n  sleep $b\ndone\n"
             );
+            // Pre-trust the agent dir in the harness config so a headless/remote
+            // spawn doesn't stall on the one-time folder-trust prompt. This only
+            // marks a directory WE just created as trusted — it doesn't change
+            // permission behavior (that's the acceptEdits/AGORA_YOLO gate above).
+            let pretrust = match harness.as_str() {
+                "claude" | "claude-code" =>
+                    "AGDIR=\"$HOME/agora-agents/PLACEHOLDER\" python3 -c 'import json,os; p=os.path.expanduser(\"~/.claude.json\"); d=json.load(open(p)) if os.path.exists(p) else {}; e=d.setdefault(\"projects\",{}).setdefault(os.environ[\"AGDIR\"],{}); e[\"hasTrustDialogAccepted\"]=True; e[\"hasCompletedProjectOnboarding\"]=True; json.dump(d,open(p,\"w\"))' 2>/dev/null; ".to_string(),
+                "codex" =>
+                    "AGDIR=\"$HOME/agora-agents/PLACEHOLDER\"; mkdir -p ~/.codex; grep -qF \"[projects.\\\"$AGDIR\\\"]\" ~/.codex/config.toml 2>/dev/null || printf '\\n[projects.\"%s\"]\\ntrust_level = \"trusted\"\\n' \"$AGDIR\" >> ~/.codex/config.toml; ".to_string(),
+                _ => String::new(),
+            }.replace("PLACEHOLDER", &name);
             let script = format!(
                 "mkdir -p ~/agora-agents/{name} && cd ~/agora-agents/{name} && \
                  printf '%s %s\\n' '{harness}' '{room}' > .agora-spawn && \
                  rm -f .agora-stop && \
+                 {pretrust}\
                  printf '%s' {prompt_q} > prompt.txt && \
                  printf '%s' {run_q} > run.sh && \
                  tmux new-session -d -s agora-{name} 'bash run.sh' && \
