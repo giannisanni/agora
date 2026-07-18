@@ -91,7 +91,11 @@ fn main() {
             let bin = match harness.as_str() {
                 "claude" | "claude-code" => {
                     let p = if yolo { "--dangerously-skip-permissions" } else { "--permission-mode acceptEdits" };
-                    format!("claude {p}{m}")
+                    // strict-mcp-config: load ONLY agora-mcp.json (written below),
+                    // ignoring project/global MCP configs — a resident agent needs
+                    // only the agora tools, and this skips the "new MCP servers
+                    // found, approve?" onboarding prompt that stalls a headless spawn.
+                    format!("claude {p} --strict-mcp-config --mcp-config agora-mcp.json{m}")
                 }
                 "codex" => {
                     let p = if yolo { "--dangerously-bypass-approvals-and-sandbox" } else { "--full-auto" };
@@ -108,24 +112,38 @@ fn main() {
             // respawn loop with exponential backoff: a fast-exiting agent (crash,
             // usage limit) backs off 5→10→...→300s instead of hammering; a run
             // that lasted >60s resets the backoff.
+            // NOTE: prompt is passed via the AGORA_PROMPT env var, not as a bare
+            // positional — claude's --mcp-config is greedy (takes multiple file
+            // args) and would otherwise swallow the prompt as a config filename.
+            // The `--` terminates option parsing so the prompt is unambiguously
+            // the query.
             let run_sh = format!(
-                "#!/bin/bash\ncd \"$(dirname \"$0\")\"\nb=5\nwhile [ ! -f .agora-stop ]; do\n  s=$SECONDS\n  {bin} \"$(cat prompt.txt)\"\n  [ -f .agora-stop ] && break\n  if [ $((SECONDS - s)) -ge 60 ]; then b=5; else b=$((b*2)); [ $b -gt 300 ] && b=300; fi\n  echo \"[agora] agent exited; restarting in ${{b}}s\"\n  sleep $b\ndone\n"
+                "#!/bin/bash\ncd \"$(dirname \"$0\")\"\nb=5\nwhile [ ! -f .agora-stop ]; do\n  s=$SECONDS\n  {bin} -- \"$(cat prompt.txt)\"\n  [ -f .agora-stop ] && break\n  if [ $((SECONDS - s)) -ge 60 ]; then b=5; else b=$((b*2)); [ $b -gt 300 ] && b=300; fi\n  echo \"[agora] agent exited; restarting in ${{b}}s\"\n  sleep $b\ndone\n"
             );
             // Pre-trust the agent dir in the harness config so a headless/remote
             // spawn doesn't stall on the one-time folder-trust prompt. This only
             // marks a directory WE just created as trusted — it doesn't change
             // permission behavior (that's the acceptEdits/AGORA_YOLO gate above).
             let pretrust = match harness.as_str() {
+                // Pre-decide every project MCP server (from ~/.mcp.json etc.) by
+                // marking them all disabled for the agent dir, so claude never
+                // shows the "N new MCP servers found, approve?" prompt. We also
+                // accept trust + mark onboarding complete. Server names are read
+                // live from ~/.mcp.json so this stays correct as it changes.
                 "claude" | "claude-code" =>
-                    "AGDIR=\"$HOME/agora-agents/PLACEHOLDER\" python3 -c 'import json,os; p=os.path.expanduser(\"~/.claude.json\"); d=json.load(open(p)) if os.path.exists(p) else {}; e=d.setdefault(\"projects\",{}).setdefault(os.environ[\"AGDIR\"],{}); e[\"hasTrustDialogAccepted\"]=True; e[\"hasCompletedProjectOnboarding\"]=True; json.dump(d,open(p,\"w\"))' 2>/dev/null; ".to_string(),
+                    "AGDIR=\"$HOME/agora-agents/PLACEHOLDER\" python3 -c 'import json,os; p=os.path.expanduser(\"~/.claude.json\"); d=json.load(open(p)) if os.path.exists(p) else {}; mp=os.path.expanduser(\"~/.mcp.json\"); names=list(json.load(open(mp)).get(\"mcpServers\",{}).keys()) if os.path.exists(mp) else []; e=d.setdefault(\"projects\",{}).setdefault(os.environ[\"AGDIR\"],{}); e[\"hasTrustDialogAccepted\"]=True; e[\"hasCompletedProjectOnboarding\"]=True; e[\"projectOnboardingSeenCount\"]=9; e[\"enabledMcpjsonServers\"]=[]; e[\"disabledMcpjsonServers\"]=names; e[\"enableAllProjectMcpServers\"]=False; json.dump(d,open(p,\"w\"))' 2>/dev/null; ".to_string(),
                 "codex" =>
                     "AGDIR=\"$HOME/agora-agents/PLACEHOLDER\"; mkdir -p ~/.codex; grep -qF \"[projects.\\\"$AGDIR\\\"]\" ~/.codex/config.toml 2>/dev/null || printf '\\n[projects.\"%s\"]\\ntrust_level = \"trusted\"\\n' \"$AGDIR\" >> ~/.codex/config.toml; ".to_string(),
                 _ => String::new(),
             }.replace("PLACEHOLDER", &name);
+            // minimal MCP config: just the agora hub, for claude --strict-mcp-config
+            let hub_url = std::env::var("AGORA_HUB").unwrap_or_else(|_| "http://100.84.87.107:8787".into());
+            let mcp_json = format!("{{\"mcpServers\":{{\"agora\":{{\"type\":\"http\",\"url\":\"{hub_url}/mcp\"}}}}}}");
             let script = format!(
                 "mkdir -p ~/agora-agents/{name} && cd ~/agora-agents/{name} && \
                  printf '%s %s\\n' '{harness}' '{room}' > .agora-spawn && \
                  rm -f .agora-stop && \
+                 printf '%s' {mcp_q} > agora-mcp.json && \
                  {pretrust}\
                  printf '%s' {prompt_q} > prompt.txt && \
                  printf '%s' {run_q} > run.sh && \
@@ -133,6 +151,7 @@ fn main() {
                  echo spawned agora-{name}",
                 prompt_q = sh_squote(&prompt),
                 run_q = sh_squote(&run_sh),
+                mcp_q = sh_squote(&mcp_json),
             );
             let (ok, out) = run(host, &script);
             print!("{out}");
