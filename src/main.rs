@@ -18,6 +18,7 @@ type Parts = axum::http::request::Parts;
 enum AgoraErr {
     Db(rusqlite::Error),
     Denied,
+    NoSuchPeer(String),
 }
 
 impl From<rusqlite::Error> for AgoraErr {
@@ -138,6 +139,19 @@ impl Db {
             [agent_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
+        // typo guard: a targeted message must name a real peer in this room
+        if let Some(recipient) = to {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT 1 FROM agents WHERE room = ?1 AND name = ?2",
+                    (&room, recipient),
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+            if !exists {
+                return Err(AgoraErr::NoSuchPeer(recipient.to_string()));
+            }
+        }
         // idempotent ingest (Mosaic sourceID pattern): same (room, source_id) -> existing event
         if let Some(sid) = source_id {
             if let Ok(existing) = conn.query_row(
@@ -347,6 +361,10 @@ fn agora_err(e: AgoraErr) -> McpError {
             "denied: this agent name/id belongs to another user".to_string(),
             None,
         ),
+        AgoraErr::NoSuchPeer(n) => McpError::invalid_params(
+            format!("no agent named '{n}' in this room — check peers for exact names"),
+            None,
+        ),
     }
 }
 
@@ -455,11 +473,14 @@ impl Agora {
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
         let kind = p.kind.as_deref().unwrap_or("msg");
+        let user = caller(&parts);
         let (id, new) = self
             .db
-            .post(p.agent_id, &caller(&parts), &p.text, p.to.as_deref(), kind, p.source_id.as_deref())
+            .post(p.agent_id, &user, &p.text, p.to.as_deref(), kind, p.source_id.as_deref())
             .map_err(agora_err)?;
-        Ok(ok_json(json!({ "message_id": id, "new": new })))
+        // monitor-the-room: every interaction also delivers your unseen mail
+        let unseen = self.db.inbox(p.agent_id, &user).map_err(agora_err)?;
+        Ok(ok_json(json!({ "message_id": id, "new": new, "new_messages": unseen })))
     }
 
     #[tool(description = "Read recent ambient activity (kind=feed) from a room, optionally filtered to one agent. Never consumes inbox state; call only when you want to catch up on what peers are doing.")]
@@ -508,8 +529,10 @@ impl Agora {
         Parameters(p): Parameters<StatusParams>,
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
-        self.db.set_status(p.agent_id, &caller(&parts), &p.status).map_err(agora_err)?;
-        Ok(ok_json(json!({ "ok": true })))
+        let user = caller(&parts);
+        self.db.set_status(p.agent_id, &user, &p.status).map_err(agora_err)?;
+        let unseen = self.db.inbox(p.agent_id, &user).map_err(agora_err)?;
+        Ok(ok_json(json!({ "ok": true, "new_messages": unseen })))
     }
 }
 
@@ -645,6 +668,7 @@ async fn http_move(
     db.move_agent(&req.name, &req.from, &req.to).map_err(|e| match e {
         AgoraErr::Denied => (axum::http::StatusCode::NOT_FOUND, "no such agent in that room".into()),
         AgoraErr::Db(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        AgoraErr::NoSuchPeer(n) => (axum::http::StatusCode::BAD_REQUEST, format!("no agent named '{n}'")),
     })?;
     Ok(axum::Json(json!({ "ok": true })))
 }
@@ -660,6 +684,7 @@ async fn ingest(
     let err = |e: AgoraErr| match e {
         AgoraErr::Db(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         AgoraErr::Denied => (StatusCode::FORBIDDEN, "name belongs to another user".into()),
+        AgoraErr::NoSuchPeer(n) => (StatusCode::BAD_REQUEST, format!("no agent named '{n}' in this room")),
     };
     let (agent_id, _) = db.join(&req.room, &req.name, &req.harness, &req.machine, "owner").map_err(err)?;
     let (id, new) = db
@@ -834,6 +859,19 @@ mod tests {
         // friend can join under their own name; owner rejoin still fine
         assert!(db.join("r", "bob", "", "", "friend").is_ok());
         assert!(db.join("r", "alice", "", "", "gianni").is_ok());
+    }
+
+    #[test]
+    fn dm_to_unknown_name_is_rejected() {
+        let db = mem();
+        let (a, _) = db.join("r", "alice", "", "", "owner").unwrap();
+        db.join("r", "pulsar-claude", "", "", "owner").unwrap();
+        // the exact bug: DM to "pulsar" when the agent is "pulsar-claude"
+        assert!(matches!(
+            db.post(a, "owner", "hi", Some("pulsar"), "msg", None),
+            Err(AgoraErr::NoSuchPeer(_))
+        ));
+        assert!(db.post(a, "owner", "hi", Some("pulsar-claude"), "msg", None).is_ok());
     }
 
     #[test]
