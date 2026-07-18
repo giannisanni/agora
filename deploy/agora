@@ -7,6 +7,7 @@ case "$1" in
   hub|serve)  shift; exec "$BIN/agora" "$@" ;;
   scribe)     shift; exec "$BIN/scribe" "$@" ;;
   wake)       shift; exec "$BIN/wake" "$@" ;;
+  spawn|kill|restart|agents) exec "$BIN/orch" "$@" ;;
   "")         exec "$BIN/tui" ;;
-  *)          echo "usage: agora [tui|hub|scribe|wake]"; exit 1 ;;
+  *)          echo "usage: agora [tui|hub|scribe|wake|spawn|kill|restart|agents]"; exit 1 ;;
 esac

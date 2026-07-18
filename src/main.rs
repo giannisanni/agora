@@ -82,7 +82,14 @@ impl Db {
         let _ = conn.execute("ALTER TABLE agents ADD COLUMN user TEXT NOT NULL DEFAULT 'owner'", []);
         conn.execute_batch(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_source
-             ON messages(room, source_id) WHERE source_id IS NOT NULL;",
+             ON messages(room, source_id) WHERE source_id IS NOT NULL;
+             CREATE TABLE IF NOT EXISTS usage(
+                machine TEXT NOT NULL,
+                harness TEXT NOT NULL,
+                tokens_5h INTEGER DEFAULT 0,
+                updated INTEGER DEFAULT 0,
+                PRIMARY KEY(machine, harness)
+             );",
         )?;
         Ok(Self(Mutex::new(conn)))
     }
@@ -308,6 +315,34 @@ impl Db {
                 }))
             })?
             .filter(|r| r.as_ref().map(|v| v["unread"].as_i64().unwrap_or(0) > 0).unwrap_or(true))
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    fn set_usage(&self, machine: &str, harness: &str, tokens_5h: i64) -> rusqlite::Result<()> {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO usage(machine, harness, tokens_5h, updated) VALUES(?1, ?2, ?3, unixepoch())
+             ON CONFLICT(machine, harness) DO UPDATE SET tokens_5h = ?3, updated = unixepoch()",
+            (machine, harness, tokens_5h),
+        )?;
+        Ok(())
+    }
+
+    fn usage(&self) -> rusqlite::Result<Vec<serde_json::Value>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT machine, harness, tokens_5h, unixepoch() - updated FROM usage ORDER BY machine, harness",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(json!({
+                    "machine": r.get::<_, String>(0)?,
+                    "harness": r.get::<_, String>(1)?,
+                    "tokens_5h": r.get::<_, i64>(2)?,
+                    "age_secs": r.get::<_, i64>(3)?,
+                }))
+            })?
             .collect::<Result<_, _>>()?;
         Ok(rows)
     }
@@ -762,6 +797,33 @@ async fn http_delroom(
     Ok(axum::Json(json!({ "deleted_agents": agents, "deleted_messages": messages })))
 }
 
+#[derive(serde::Deserialize)]
+struct UsageReq {
+    machine: String,
+    harness: String,
+    tokens_5h: i64,
+}
+
+async fn http_usage_post(
+    axum::extract::State(db): axum::extract::State<Arc<Db>>,
+    headers: axum::http::HeaderMap,
+    axum::Json(req): axum::Json<UsageReq>,
+) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    check_token(&headers)?;
+    db.set_usage(&req.machine, &req.harness, req.tokens_5h)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(axum::Json(json!({ "ok": true })))
+}
+
+async fn http_usage_get(
+    axum::extract::State(db): axum::extract::State<Arc<Db>>,
+    headers: axum::http::HeaderMap,
+) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    check_token(&headers)?;
+    let u = db.usage().map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(axum::Json(json!({ "usage": u })))
+}
+
 // plain HTTP door for the scribe daemon, gated by a shared secret
 async fn ingest(
     axum::extract::State(db): axum::extract::State<Arc<Db>>,
@@ -815,6 +877,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/move", axum::routing::post(http_move))
         .route("/kick", axum::routing::post(http_kick))
         .route("/delroom", axum::routing::post(http_delroom))
+        .route("/usage", axum::routing::get(http_usage_get).post(http_usage_post))
         .route("/wakeable", axum::routing::get(http_wakeable))
         .with_state(db_state)
         .nest_service("/mcp", service);

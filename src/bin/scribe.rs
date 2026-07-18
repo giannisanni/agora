@@ -50,7 +50,13 @@ fn main() {
     }
 
     println!("scribe: room={room} hub={hub} machine={machine} dirs={dirs:?}");
+    let mut cycle: u32 = 0;
     loop {
+        // usage report every ~60s: rolling-5h token totals per harness
+        if cycle % 4 == 0 {
+            report_usage(&hub, &machine, &home);
+        }
+        cycle = cycle.wrapping_add(1);
         let mut posted = 0;
         for file in active_files(&format!("{home}/.claude/projects"), "jsonl") {
             posted += mirror(&hub, &room, &machine, "claude-code", &file, parse_claude, &dirs);
@@ -66,6 +72,62 @@ fn main() {
         }
         std::thread::sleep(Duration::from_secs(POLL_SECS));
     }
+}
+
+/// Sum of input+output tokens in transcripts touched within the last 5h.
+/// ponytail: file-mtime gate, whole-tail sums — an approximation (old lines in
+/// a live file count); good enough as a routing signal, not billing.
+fn cc_tokens_5h(home: &str) -> i64 {
+    let mut total = 0i64;
+    let found = sh("find", &[&format!("{home}/.claude/projects"), "-name", "*.jsonl", "-mmin", "-300", "-type", "f"]);
+    for path in found.lines() {
+        for line in read_tail(std::path::Path::new(path)).lines() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                let u = &v["message"]["usage"];
+                total += u["input_tokens"].as_i64().unwrap_or(0) + u["output_tokens"].as_i64().unwrap_or(0);
+            }
+        }
+    }
+    total
+}
+
+fn codex_tokens_5h(home: &str) -> i64 {
+    let mut total = 0i64;
+    let found = sh("find", &[&format!("{home}/.codex/sessions"), "-name", "*.jsonl", "-mmin", "-300", "-type", "f"]);
+    for path in found.lines() {
+        // last token_count event carries the session-cumulative total
+        let mut last = 0i64;
+        for line in read_tail(std::path::Path::new(path)).lines() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if v["payload"]["type"].as_str() == Some("token_count") {
+                    if let Some(t) = v["payload"]["info"]["total_token_usage"]["total_tokens"].as_i64() {
+                        last = t;
+                    }
+                }
+            }
+        }
+        total += last;
+    }
+    total
+}
+
+fn report_usage(hub: &str, machine: &str, home: &str) {
+    let token = std::env::var("AGORA_INGEST_TOKEN").unwrap_or_default();
+    for (harness, tokens) in [("claude-code", cc_tokens_5h(home)), ("codex", codex_tokens_5h(home))] {
+        let payload = serde_json::json!({ "machine": machine, "harness": harness, "tokens_5h": tokens });
+        let _ = ureq::post(&format!("{hub}/usage"))
+            .header("x-agora-token", &token)
+            .send_json(&payload);
+    }
+}
+
+fn sh(cmd: &str, args: &[&str]) -> String {
+    std::process::Command::new(cmd)
+        .args(args)
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default()
 }
 
 fn hostname() -> String {

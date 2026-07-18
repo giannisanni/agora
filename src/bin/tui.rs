@@ -26,6 +26,11 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("move", "<agent> <room>", "Move an agent from this room to another"),
     ("name", "<me>", "Change the name you post as"),
     ("kick", "<agent> [agent...]", "Remove agent(s) from this room"),
+    ("spawn", "<name> [harness] [host]", "Spawn a resident agent in tmux (here or user@host)"),
+    ("agents", "", "List spawned tmux agents"),
+    ("killagent", "<name> [host]", "Kill a spawned tmux agent"),
+    ("restart", "<name> [host]", "Restart a spawned tmux agent"),
+    ("usage", "", "Show 5h token usage per machine/harness"),
     ("delroom", "<room>", "Delete a room (all its agents + messages)"),
     ("quit", "", "Exit the TUI"),
 ];
@@ -197,6 +202,18 @@ impl App {
         self.refresh();
     }
 
+    fn orch(&mut self, args: &[String]) {
+        let bin = format!("{}/workspace/agora/target/release/orch", std::env::var("HOME").unwrap_or_default());
+        match std::process::Command::new(&bin).args(args).output() {
+            Ok(o) => {
+                let text = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+                self.status = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                self.refresh();
+            }
+            Err(e) => self.status = format!("orch failed: {e}"),
+        }
+    }
+
     fn fetch_rooms(&mut self) {
         if let Some(v) = get(&format!("{}/rooms", self.hub), &self.token) {
             self.rooms = v["rooms"].as_array().cloned().unwrap_or_default()
@@ -314,9 +331,54 @@ impl App {
             }
             ("name", Some(n), _) => {
                 self.name = n.to_string();
-                self.status = format!("posting as {}", self.name);
+                if let Ok(home) = std::env::var("HOME") {
+                    let _ = std::fs::write(format!("{home}/.agora-name"), &self.name);
+                }
+                self.status = format!("posting as {} (saved)", self.name);
             }
             ("quit", _, _) => self.quit = true,
+            ("spawn", Some(n), h) => {
+                let mut args = vec!["spawn".to_string(), n.to_string(), "--room".into(), self.room.clone()];
+                if let Some(h) = h {
+                    if h.contains('@') { args.extend(["--on".into(), h.into()]); }
+                    else { args.extend(["--harness".into(), h.into()]); }
+                }
+                if let Some(host) = parts.next() { args.extend(["--on".into(), host.to_string()]); }
+                self.orch(&args);
+            }
+            ("agents", h, _) => {
+                let mut args = vec!["agents".to_string()];
+                if let Some(h) = h { args.extend(["--on".into(), h.into()]); }
+                self.orch(&args);
+            }
+            ("killagent", Some(n), h) => {
+                let mut args = vec!["kill".to_string(), n.to_string()];
+                if let Some(h) = h { args.extend(["--on".into(), h.into()]); }
+                self.orch(&args);
+            }
+            ("restart", Some(n), h) => {
+                let mut args = vec!["restart".to_string(), n.to_string()];
+                if let Some(h) = h { args.extend(["--on".into(), h.into()]); }
+                self.orch(&args);
+            }
+            ("usage", _, _) => match get(&format!("{}/usage", self.hub), &self.token) {
+                Some(v) => {
+                    let list: Vec<String> = v["usage"].as_array().cloned().unwrap_or_default()
+                        .iter()
+                        .map(|u| {
+                            let t = u["tokens_5h"].as_i64().unwrap_or(0);
+                            let tt = if t >= 1_000_000 { format!("{:.1}M", t as f64 / 1e6) }
+                                     else { format!("{}k", t / 1000) };
+                            format!("{}/{}: {tt}",
+                                u["machine"].as_str().unwrap_or("?"),
+                                u["harness"].as_str().unwrap_or("?"))
+                        })
+                        .collect();
+                    self.status = if list.is_empty() { "usage: no reports yet".into() }
+                                  else { format!("5h tokens — {}", list.join("  ")) };
+                }
+                None => self.status = "usage: fetch failed".into(),
+            },
             ("kick", Some(_), _) => {
                 let names: Vec<String> = cmd.split_whitespace().skip(1).map(String::from).collect();
                 let payload = serde_json::json!({ "room": self.room, "names": names });
@@ -544,10 +606,14 @@ impl App {
 fn main() -> io::Result<()> {
     let hub = std::env::var("AGORA_HUB").unwrap_or_else(|_| "http://100.84.87.107:8787".into());
     let room = std::env::var("AGORA_ROOM").unwrap_or_else(|_| "dev".into());
-    let name = std::env::var("AGORA_NAME").unwrap_or_else(|_| {
-        let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
-        format!("{user}-tui")
-    });
+    let home_dir = std::env::var("HOME").unwrap_or_default();
+    let name = std::env::var("AGORA_NAME")
+        .ok()
+        .or_else(|| std::fs::read_to_string(format!("{home_dir}/.agora-name")).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| {
+            let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
+            format!("{user}-tui")
+        });
     let token = std::env::var("AGORA_INGEST_TOKEN").ok().or_else(|| {
         let home = std::env::var("HOME").ok()?;
         std::fs::read_to_string(format!("{home}/.agora-ingest-token")).ok()
