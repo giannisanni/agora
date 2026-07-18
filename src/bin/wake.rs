@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-const POLL_SECS: u64 = 20;
-const COOLDOWN_SECS: u64 = 180;
+const POLL_SECS: u64 = 5;    // fast enough that a DM feels like a push
+const COOLDOWN_SECS: u64 = 45;
 
 fn sh(cmd: &str, args: &[&str]) -> String {
     Command::new(cmd)
@@ -24,10 +24,40 @@ fn sh(cmd: &str, args: &[&str]) -> String {
         .unwrap_or_default()
 }
 
-fn nudge_text(unread: i64) -> String {
-    format!(
-        "agora wake: you have {unread} unread message(s). Check your agora inbox, respond to what you find, then park in wait_for_messages instead of going idle."
-    )
+/// Most recent inbox-class message addressed to `name` (or broadcast), from
+/// the non-consuming /messages view — used to preview content in the nudge.
+fn latest_for(hub: &str, token: &str, room: &str, name: &str) -> Option<(String, String)> {
+    let v: serde_json::Value = ureq::get(&format!("{hub}/messages?room={room}&limit=15"))
+        .header("x-agora-token", token)
+        .call()
+        .ok()?
+        .body_mut()
+        .read_json()
+        .ok()?;
+    v["messages"].as_array()?.iter().rev().find_map(|m| {
+        let to = m["to"].as_str();
+        let from = m["from"].as_str()?;
+        if from != name && (to.is_none() || to == Some(name)) {
+            Some((from.to_string(), m["body"].as_str().unwrap_or("").to_string()))
+        } else {
+            None
+        }
+    })
+}
+
+fn nudge_text(unread: i64, preview: Option<(String, String)>) -> String {
+    match preview {
+        Some((from, body)) => {
+            let short: String = body.chars().take(160).collect();
+            format!(
+                "agora: new message from {from}: \"{short}\" ({unread} unread total). \
+                 Check your agora inbox and respond, then park in wait_for_messages."
+            )
+        }
+        None => format!(
+            "agora: you have {unread} unread message(s). Check your agora inbox, respond, then park in wait_for_messages."
+        ),
+    }
 }
 
 /// cwd -> agent_id from .agora-agent-id files under the configured dirs.
@@ -293,6 +323,8 @@ fn main() {
             for agent in &wakeable {
                 let id = agent["agent_id"].as_i64().unwrap_or(0);
                 let unread = agent["unread"].as_i64().unwrap_or(0);
+                let name = agent["name"].as_str().unwrap_or("");
+                let room = agent["room"].as_str().unwrap_or("dev");
                 let Some(cwd) = locals.iter().find(|(_, aid)| **aid == id).map(|(c, _)| c.clone()) else {
                     continue; // not an agent on this machine
                 };
@@ -300,8 +332,9 @@ fn main() {
                     continue;
                 }
                 if let Some((target, _)) = terms.iter().find(|(_, tcwd)| *tcwd == cwd) {
-                    if wake(target, &nudge_text(unread)) {
-                        println!("woke agent {id} at {cwd} ({unread} unread)");
+                    let preview = latest_for(&hub, &token, room, name);
+                    if wake(target, &nudge_text(unread, preview)) {
+                        println!("woke agent {id} ({name}) at {cwd} ({unread} unread)");
                         last_wake.insert(id, Instant::now());
                     }
                 }
