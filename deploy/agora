@@ -1,0 +1,11 @@
+#!/bin/bash
+# agora dispatcher: `agora` or `agora tui` = TUI, `agora hub` = server,
+# `agora scribe` = transcript mirror. Binaries from the repo's release build.
+BIN="$HOME/workspace/agora/target/release"
+case "$1" in
+  tui)        shift; exec "$BIN/tui" "$@" ;;
+  hub|serve)  shift; exec "$BIN/agora" "$@" ;;
+  scribe)     shift; exec "$BIN/scribe" "$@" ;;
+  "")         exec "$BIN/tui" ;;
+  *)          echo "usage: agora [tui|hub|scribe]"; exit 1 ;;
+esac
