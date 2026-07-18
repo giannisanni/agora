@@ -17,6 +17,12 @@ struct Db(Mutex<Connection>);
 
 const BACKLOG: i64 = 20;
 const WINDOW: i64 = 5000; // rolling message window kept in the db
+const FEED_BODY_CAP: usize = 800; // Mosaic-style bound: feed reads truncate long bodies
+
+// Typed kinds, borrowed from Mosaic's event taxonomy. Delivery class:
+// inbox kinds interrupt/deliver to recipients; feed kinds are ambient (pull-only).
+const FEED_KINDS: &str = "'feed','summary','status','finding','decision','file_changed','test_result','review_finding'";
+// everything else ('msg','message','task','handoff','question','blocker', unknown) -> inbox
 
 impl Db {
     fn open(path: &str) -> rusqlite::Result<Self> {
@@ -43,8 +49,13 @@ impl Db {
                 created INTEGER DEFAULT (unixepoch())
             );",
         )?;
-        // lazy migration for pre-kind dbs; harmless error if column exists
+        // lazy migrations; harmless errors if columns exist
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL DEFAULT 'msg'", []);
+        let _ = conn.execute("ALTER TABLE messages ADD COLUMN source_id TEXT", []);
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_source
+             ON messages(room, source_id) WHERE source_id IS NOT NULL;",
+        )?;
         Ok(Self(Mutex::new(conn)))
     }
 
@@ -72,16 +83,26 @@ impl Db {
         Ok((id, backlog))
     }
 
-    fn post(&self, agent_id: i64, text: &str, to: Option<&str>, kind: &str) -> rusqlite::Result<i64> {
+    fn post(&self, agent_id: i64, text: &str, to: Option<&str>, kind: &str, source_id: Option<&str>) -> rusqlite::Result<i64> {
         let conn = self.0.lock().unwrap();
         let (room, name): (String, String) = conn.query_row(
             "SELECT room, name FROM agents WHERE id = ?1",
             [agent_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
+        // idempotent ingest (Mosaic sourceID pattern): same (room, source_id) -> existing event
+        if let Some(sid) = source_id {
+            if let Ok(existing) = conn.query_row(
+                "SELECT id FROM messages WHERE room = ?1 AND source_id = ?2",
+                (&room, sid),
+                |r| r.get::<_, i64>(0),
+            ) {
+                return Ok(existing);
+            }
+        }
         conn.execute(
-            "INSERT INTO messages(room, sender, recipient, body, kind) VALUES(?1, ?2, ?3, ?4, ?5)",
-            (&room, &name, to, text, kind),
+            "INSERT INTO messages(room, sender, recipient, body, kind, source_id) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            (&room, &name, to, text, kind, source_id),
         )?;
         let id = conn.last_insert_rowid();
         Self::touch(&conn, agent_id);
@@ -108,12 +129,12 @@ impl Db {
     }
 
     fn messages_after(conn: &Connection, room: &str, me: &str, after: i64, limit: Option<i64>) -> rusqlite::Result<Vec<serde_json::Value>> {
-        let mut stmt = conn.prepare(
-            "SELECT id, sender, recipient, body, created FROM messages
-             WHERE room = ?1 AND id > ?2 AND sender != ?3 AND kind = 'msg'
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, sender, recipient, body, created, kind FROM messages
+             WHERE room = ?1 AND id > ?2 AND sender != ?3 AND kind NOT IN ({FEED_KINDS})
                AND (recipient IS NULL OR recipient = ?3)
              ORDER BY id DESC LIMIT ?4",
-        )?;
+        ))?;
         let mut rows: Vec<serde_json::Value> = stmt
             .query_map((room, after, me, limit.unwrap_or(i64::MAX)), |r| {
                 Ok(json!({
@@ -122,6 +143,7 @@ impl Db {
                     "to": r.get::<_, Option<String>>(2)?,
                     "body": r.get::<_, String>(3)?,
                     "at": r.get::<_, i64>(4)?,
+                    "kind": r.get::<_, String>(5)?,
                 }))
             })?
             .collect::<Result<_, _>>()?;
@@ -152,18 +174,27 @@ impl Db {
     // feed reads never touch cursors: ambient visibility is pull-on-demand
     fn feed(&self, room: &str, from: Option<&str>, limit: i64) -> rusqlite::Result<Vec<serde_json::Value>> {
         let conn = self.0.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, sender, body, created FROM messages
-             WHERE room = ?1 AND kind = 'feed' AND (?2 IS NULL OR sender = ?2)
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, sender, body, created, kind FROM messages
+             WHERE room = ?1 AND kind IN ({FEED_KINDS}) AND (?2 IS NULL OR sender = ?2)
              ORDER BY id DESC LIMIT ?3",
-        )?;
+        ))?;
         let mut rows: Vec<serde_json::Value> = stmt
             .query_map((room, from, limit), |r| {
+                let body: String = r.get(2)?;
+                let capped = if body.chars().count() > FEED_BODY_CAP {
+                    let mut s: String = body.chars().take(FEED_BODY_CAP).collect();
+                    s.push_str("...");
+                    s
+                } else {
+                    body
+                };
                 Ok(json!({
                     "id": r.get::<_, i64>(0)?,
                     "from": r.get::<_, String>(1)?,
-                    "body": r.get::<_, String>(2)?,
+                    "body": capped,
                     "at": r.get::<_, i64>(3)?,
+                    "kind": r.get::<_, String>(4)?,
                 }))
             })?
             .collect::<Result<_, _>>()?;
@@ -209,9 +240,13 @@ struct PostParams {
     text: String,
     /// Optional recipient agent name for a targeted message; omit to broadcast
     to: Option<String>,
-    /// "msg" (default, delivered via inbox) or "feed" (ambient activity, read via feed tool only)
+    /// Semantic kind. Inbox-delivered: msg (default), task, handoff, question, blocker.
+    /// Ambient (feed tool only): feed, summary, status, finding, decision, file_changed, test_result, review_finding.
     #[serde(default)]
     kind: Option<String>,
+    /// Idempotency key: reposting the same source_id to a room returns the existing message instead of duplicating
+    #[serde(default)]
+    source_id: Option<String>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -270,14 +305,13 @@ impl Agora {
         Ok(ok_json(json!({ "agent_id": id, "backlog": backlog })))
     }
 
-    #[tool(description = "Post a message to your room. Broadcast by default; set `to` for a targeted message. kind=feed for ambient activity updates.")]
+    #[tool(description = "Post to your room. Broadcast by default; set `to` for a targeted message. Inbox kinds (msg/task/handoff/question/blocker) deliver to recipients; feed kinds (feed/summary/status/finding/decision/file_changed/test_result/review_finding) are ambient. source_id makes the post idempotent.")]
     fn post(&self, Parameters(p): Parameters<PostParams>) -> Result<CallToolResult, McpError> {
-        let kind = match p.kind.as_deref() {
-            None | Some("msg") => "msg",
-            Some("feed") => "feed",
-            Some(other) => return Err(McpError::invalid_params(format!("unknown kind: {other}"), None)),
-        };
-        let id = self.db.post(p.agent_id, &p.text, p.to.as_deref(), kind).map_err(db_err)?;
+        let kind = p.kind.as_deref().unwrap_or("msg");
+        let id = self
+            .db
+            .post(p.agent_id, &p.text, p.to.as_deref(), kind, p.source_id.as_deref())
+            .map_err(db_err)?;
         Ok(ok_json(json!({ "message_id": id })))
     }
 
@@ -377,7 +411,7 @@ mod tests {
         let (a, _) = db.join("r", "alice", "", "").unwrap();
         let (b, _) = db.join("r", "bob", "", "").unwrap();
 
-        db.post(a, "hi bob", None, "msg").unwrap();
+        db.post(a, "hi bob", None, "msg", None).unwrap();
         let got = db.inbox(b).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0]["body"], "hi bob");
@@ -394,7 +428,7 @@ mod tests {
         let (b, _) = db.join("r", "bob", "", "").unwrap();
         let (c, _) = db.join("r", "carol", "", "").unwrap();
 
-        db.post(a, "for bob only", Some("bob"), "msg").unwrap();
+        db.post(a, "for bob only", Some("bob"), "msg", None).unwrap();
         assert_eq!(db.inbox(b).unwrap().len(), 1);
         assert!(db.inbox(c).unwrap().is_empty());
         // carol's cursor advanced past the filtered message; nothing re-delivers later
@@ -406,9 +440,9 @@ mod tests {
         let db = mem();
         let (a, _) = db.join("r", "alice", "", "").unwrap();
         let (b, _) = db.join("r", "bob", "", "").unwrap();
-        db.post(a, "one", None, "msg").unwrap();
+        db.post(a, "one", None, "msg", None).unwrap();
         assert_eq!(db.inbox(b).unwrap().len(), 1);
-        db.post(a, "two", None, "msg").unwrap();
+        db.post(a, "two", None, "msg", None).unwrap();
 
         // bob rejoins (new session): same id preserved, cursor intact,
         // inbox still delivers only the unseen "two"
@@ -426,8 +460,8 @@ mod tests {
         let (a, _) = db.join("r", "alice", "", "").unwrap();
         let (b, _) = db.join("r", "bob", "", "").unwrap();
 
-        db.post(a, "turn 1: refactoring auth", None, "feed").unwrap();
-        db.post(a, "hey bob, need review", None, "msg").unwrap();
+        db.post(a, "turn 1: refactoring auth", None, "feed", None).unwrap();
+        db.post(a, "hey bob, need review", None, "msg", None).unwrap();
 
         // inbox delivers only the msg, never feed entries
         let got = db.inbox(b).unwrap();
@@ -440,6 +474,37 @@ mod tests {
             assert_eq!(f.len(), 1);
             assert_eq!(f[0]["body"], "turn 1: refactoring auth");
         }
+    }
+
+    #[test]
+    fn source_id_is_idempotent() {
+        let db = mem();
+        let (a, _) = db.join("r", "alice", "", "").unwrap();
+        let (b, _) = db.join("r", "bob", "", "").unwrap();
+
+        let m1 = db.post(a, "turn text", None, "summary", Some("uuid-1")).unwrap();
+        let m2 = db.post(a, "turn text", None, "summary", Some("uuid-1")).unwrap();
+        assert_eq!(m1, m2); // scribe can re-scan transcripts safely
+        assert_eq!(db.feed("r", None, 20).unwrap().len(), 1);
+        let _ = b;
+    }
+
+    #[test]
+    fn kind_classes_route_correctly() {
+        let db = mem();
+        let (a, _) = db.join("r", "alice", "", "").unwrap();
+        let (b, _) = db.join("r", "bob", "", "").unwrap();
+
+        db.post(a, "urgent", Some("bob"), "blocker", None).unwrap();
+        db.post(a, "tests green", None, "test_result", None).unwrap();
+
+        // blocker -> inbox; test_result -> feed only
+        let got = db.inbox(b).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0]["kind"], "blocker");
+        let f = db.feed("r", None, 20).unwrap();
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0]["kind"], "test_result");
     }
 
     #[test]
