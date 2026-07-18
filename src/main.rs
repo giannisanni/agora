@@ -997,7 +997,10 @@ fn dispatch() {
         _ => return,           // unknown -> fall through to hub (or its arg parsing)
     };
     if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
+        // resolve symlinks so we find siblings in the REAL install dir, not the
+        // symlink's dir (e.g. /opt/homebrew/bin/agora -> .../release/agora).
+        let real = std::fs::canonicalize(&exe).unwrap_or(exe);
+        if let Some(dir) = real.parent() {
             let target = dir.join(bin);
             let path = if target.exists() { target } else { std::path::PathBuf::from(bin) };
             let err = std::process::Command::new(path).args(&forward).exec_or_status();
