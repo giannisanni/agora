@@ -140,6 +140,56 @@ end tell"#;
     out
 }
 
+/// Bring a terminal to the foreground (best-effort per app).
+fn bring_to_front(target: &Target) -> bool {
+    match target {
+        Target::Terminal(tty) => {
+            let script = format!(
+                r#"tell application "Terminal"
+activate
+repeat with w in windows
+repeat with t in tabs of w
+if (tty of t) is "{tty}" then
+set selected tab of w to t
+set index of w to 1
+end if
+end repeat
+end repeat
+end tell"#
+            );
+            Command::new("osascript").args(["-e", &script]).status().is_ok()
+        }
+        Target::Iterm(sid) => {
+            let script = format!(
+                r#"tell application "iTerm2"
+activate
+repeat with w in windows
+repeat with t in tabs of w
+repeat with s in sessions of t
+if (id of s as text) is "{sid}" then
+select t
+select w
+end if
+end repeat
+end repeat
+end repeat
+end tell"#
+            );
+            Command::new("osascript").args(["-e", &script]).status().is_ok()
+        }
+        Target::Mosaic(surf) => {
+            // focus the surface's pane, flash it, and raise the app
+            let _ = Command::new("mosaic").args(["focus-pane", "--pane", surf]).status();
+            let _ = Command::new("mosaic").args(["trigger-flash", "--surface", surf]).status();
+            Command::new("open").args(["-a", "Mosaic"]).status().is_ok()
+        }
+        Target::Tmux(pane) => {
+            // select the window holding the pane; can't force the host terminal forward
+            Command::new("tmux").args(["select-window", "-t", pane]).status().is_ok()
+        }
+    }
+}
+
 fn wake(target: &Target, text: &str) -> bool {
     match target {
         Target::Tmux(id) => {
@@ -188,10 +238,33 @@ end tell"#,
     }
 }
 
+/// `wake reveal <agent_id>`: find that agent's local terminal and raise it.
+fn reveal(agent_id: i64, dirs: &str) {
+    let cwd = match local_agents(dirs).into_iter().find(|(_, id)| *id == agent_id) {
+        Some((cwd, _)) => cwd,
+        None => {
+            println!("not local (no .agora-agent-id for agent {agent_id} under {dirs})");
+            return;
+        }
+    };
+    match terminals().into_iter().find(|(_, tcwd)| *tcwd == cwd) {
+        Some((target, _)) if bring_to_front(&target) => println!("revealed agent {agent_id} at {cwd}"),
+        Some(_) => println!("found terminal but could not raise it"),
+        None => println!("no open terminal at {cwd}"),
+    }
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
     let hub = std::env::var("AGORA_HUB").unwrap_or_else(|_| "http://100.84.87.107:8787".into());
     let home = std::env::var("HOME").expect("HOME not set");
     let dirs = std::env::var("AGORA_WAKE_DIRS").unwrap_or_else(|_| format!("{home}/workspace"));
+
+    if args.first().map(String::as_str) == Some("reveal") {
+        let id: i64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(-1);
+        reveal(id, &dirs);
+        return;
+    }
     let token = std::env::var("AGORA_INGEST_TOKEN")
         .ok()
         .or_else(|| std::fs::read_to_string(format!("{home}/.agora-ingest-token")).ok())

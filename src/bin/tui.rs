@@ -65,6 +65,7 @@ struct App {
 #[derive(Clone, Copy)]
 enum MenuAction {
     Message,
+    Reveal,
     Kick,
     Move,
     Close,
@@ -532,8 +533,9 @@ impl App {
             y += h;
             // context menu under the open peer
             if self.peer_menu == Some(idx) {
-                let items: [(&str, MenuAction); 4] = [
+                let items: [(&str, MenuAction); 5] = [
                     ("  ✉ message", MenuAction::Message),
+                    ("  ⤒ reveal", MenuAction::Reveal),
                     ("  ✂ kick", MenuAction::Kick),
                     ("  → move…", MenuAction::Move),
                     ("  ✕ close", MenuAction::Close),
@@ -558,6 +560,14 @@ impl App {
         let Some(idx) = self.peer_menu.take() else { return };
         let Some(name) = self.peers.get(idx).and_then(|p| p["name"].as_str()).map(String::from) else { return };
         match action {
+            MenuAction::Reveal => {
+                let id = self.peers.get(idx).and_then(|p| p["id"].as_i64()).unwrap_or(-1);
+                let bin = format!("{}/workspace/agora/target/release/wake", std::env::var("HOME").unwrap_or_default());
+                match std::process::Command::new(&bin).args(["reveal", &id.to_string()]).output() {
+                    Ok(o) => self.status = String::from_utf8_lossy(&o.stdout).trim().to_string(),
+                    Err(e) => self.status = format!("reveal failed: {e}"),
+                }
+            }
             MenuAction::Message => {
                 // append recipients: @a @b message
                 let trimmed = self.input.trim_start().to_string();
@@ -777,7 +787,7 @@ fn main() -> io::Result<()> {
                         }
                         (KeyCode::Enter, _) => app.send(),
                         (KeyCode::Up, _) if menu_open => app.menu_sel = app.menu_sel.saturating_sub(1),
-                        (KeyCode::Down, _) if menu_open => app.menu_sel = (app.menu_sel + 1).min(3),
+                        (KeyCode::Down, _) if menu_open => app.menu_sel = (app.menu_sel + 1).min(4),
                         (KeyCode::Up, _) if popup => app.suggest_idx = app.suggest_idx.saturating_sub(1),
                         (KeyCode::Down, _) if popup => {
                             app.suggest_idx = (app.suggest_idx + 1).min(app.suggestions().len().saturating_sub(1));

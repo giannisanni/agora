@@ -224,7 +224,7 @@ impl Db {
     fn peers(&self, room: &str) -> rusqlite::Result<Vec<serde_json::Value>> {
         let conn = self.0.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT name, harness, machine, status, unixepoch() - last_seen FROM agents
+            "SELECT name, harness, machine, status, unixepoch() - last_seen, id FROM agents
              WHERE room = ?1 ORDER BY last_seen DESC",
         )?;
         let rows = stmt
@@ -235,6 +235,7 @@ impl Db {
                     "machine": r.get::<_, Option<String>>(2)?,
                     "status": r.get::<_, String>(3)?,
                     "idle_secs": r.get::<_, i64>(4)?,
+                    "id": r.get::<_, i64>(5)?,
                 }))
             })?
             .collect::<Result<_, _>>()?;
