@@ -70,6 +70,7 @@ enum MenuAction {
     Message,
     Reveal,
     Restart,
+    Kill,
     Kick,
     Move,
     Close,
@@ -258,6 +259,19 @@ impl App {
 
     /// Context-aware autocomplete: /commands, @peers, and argument completion
     /// for /kick /move /room /delroom.
+    /// Persistent signature hint shown while typing a known command's args
+    /// (e.g. after "/spawn " → "/spawn <name> [harness] [host]" + description).
+    fn cmd_hint(&self) -> Option<(String, String)> {
+        let rest = self.input.strip_prefix('/')?;
+        let cmd = rest.split(' ').next().unwrap_or("");
+        if cmd.is_empty() {
+            return None;
+        }
+        COMMANDS.iter().find(|(n, _, _)| *n == cmd).map(|(n, args, d)| {
+            (format!("/{n} {args}"), d.to_string())
+        })
+    }
+
     fn suggestions(&self) -> Vec<Suggestion> {
         let input = &self.input;
         // "/cmd" being typed
@@ -591,10 +605,11 @@ impl App {
             y += h;
             // context menu under the open peer
             if self.peer_menu == Some(idx) {
-                let items: [(&str, MenuAction); 6] = [
+                let items: [(&str, MenuAction); 7] = [
                     ("  ✉ message", MenuAction::Message),
                     ("  ⤒ reveal", MenuAction::Reveal),
                     ("  ↻ restart", MenuAction::Restart),
+                    ("  ⏹ kill", MenuAction::Kill),
                     ("  ✂ kick", MenuAction::Kick),
                     ("  → move…", MenuAction::Move),
                     ("  ✕ close", MenuAction::Close),
@@ -621,6 +636,10 @@ impl App {
         match action {
             MenuAction::Restart => {
                 self.orch(&["restart".to_string(), name.clone()]);
+            }
+            MenuAction::Kill => {
+                // stop the process but keep the roster entry (red, restartable)
+                self.orch(&["kill".to_string(), name.clone()]);
             }
             MenuAction::Reveal => {
                 let id = self.peers.get(idx).and_then(|p| p["id"].as_i64()).unwrap_or(-1);
@@ -798,25 +817,36 @@ fn main() -> io::Result<()> {
             );
             // Claude Code-style slash popup above the input
             let sugg = app.suggestions();
+            let popup_w = outer[1].width.min(90) as usize;
+            // clip a row to popup width so long descriptions don't overflow
+            let clip_row = |label: &str, desc: &str| -> Line<'static> {
+                let gap = 26usize.saturating_sub(label.chars().count()).max(1);
+                let used = label.chars().count() + gap;
+                let dmax = popup_w.saturating_sub(used + 1);
+                let d: String = if desc.chars().count() <= dmax { desc.to_string() }
+                    else { desc.chars().take(dmax.saturating_sub(1)).collect::<String>() + "…" };
+                Line::from(vec![
+                    Span::styled(label.to_string(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::raw(" ".repeat(gap)),
+                    Span::styled(d, Style::default().fg(Color::Gray)),
+                ])
+            };
             if !sugg.is_empty() {
                 let h = sugg.len() as u16;
-                let w = outer[1].width.min(72);
-                let area = Rect::new(outer[1].x, outer[1].y.saturating_sub(h), w, h);
+                let area = Rect::new(outer[1].x, outer[1].y.saturating_sub(h), popup_w as u16, h);
                 f.render_widget(ratatui::widgets::Clear, area);
                 let rows: Vec<Line> = sugg.iter().enumerate().map(|(i, s)| {
                     let selected = i == app.suggest_idx.min(sugg.len() - 1);
-                    let row_style = if selected {
-                        Style::default().bg(Color::Rgb(40, 44, 56))
-                    } else {
-                        Style::default()
-                    };
-                    Line::from(vec![
-                        Span::styled(s.label.clone(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD).patch(row_style)),
-                        Span::styled(" ".repeat(26usize.saturating_sub(s.label.chars().count())), row_style),
-                        Span::styled(s.desc.clone(), Style::default().fg(Color::Gray).patch(row_style)),
-                    ]).style(row_style)
+                    let mut line = clip_row(&s.label, &s.desc);
+                    if selected { line = line.style(Style::default().bg(Color::Rgb(40, 44, 56))); }
+                    line
                 }).collect();
                 f.render_widget(Paragraph::new(rows), area);
+            } else if let Some((sig, desc)) = app.cmd_hint() {
+                // persistent arg-signature hint while typing a command's args
+                let area = Rect::new(outer[1].x, outer[1].y.saturating_sub(1), popup_w as u16, 1);
+                f.render_widget(ratatui::widgets::Clear, area);
+                f.render_widget(Paragraph::new(clip_row(&sig, &desc)), area);
             }
             f.set_cursor_position((
                 outer[1].x + 1 + app.input.chars().count() as u16,
@@ -849,7 +879,7 @@ fn main() -> io::Result<()> {
                         }
                         (KeyCode::Enter, _) => app.send(),
                         (KeyCode::Up, _) if menu_open => app.menu_sel = app.menu_sel.saturating_sub(1),
-                        (KeyCode::Down, _) if menu_open => app.menu_sel = (app.menu_sel + 1).min(5),
+                        (KeyCode::Down, _) if menu_open => app.menu_sel = (app.menu_sel + 1).min(6),
                         (KeyCode::Up, _) if popup => app.suggest_idx = app.suggest_idx.saturating_sub(1),
                         (KeyCode::Down, _) if popup => {
                             app.suggest_idx = (app.suggest_idx + 1).min(app.suggestions().len().saturating_sub(1));
