@@ -319,6 +319,15 @@ impl Db {
         Ok(rows)
     }
 
+    fn rename_agent(&self, room: &str, old: &str, new: &str) -> rusqlite::Result<usize> {
+        let conn = self.0.lock().unwrap();
+        let n = conn.execute("UPDATE agents SET name = ?1 WHERE room = ?2 AND name = ?3", (new, room, old))?;
+        // keep history + routing consistent
+        conn.execute("UPDATE messages SET sender = ?1 WHERE room = ?2 AND sender = ?3", (new, room, old))?;
+        conn.execute("UPDATE messages SET recipient = ?1 WHERE room = ?2 AND recipient = ?3", (new, room, old))?;
+        Ok(n)
+    }
+
     fn set_usage(&self, machine: &str, harness: &str, tokens_5h: i64) -> rusqlite::Result<()> {
         let conn = self.0.lock().unwrap();
         conn.execute(
@@ -798,6 +807,46 @@ async fn http_delroom(
 }
 
 #[derive(serde::Deserialize)]
+struct HeartbeatReq {
+    room: String,
+    name: String,
+    #[serde(default)]
+    harness: String,
+    #[serde(default)]
+    machine: String,
+}
+
+async fn http_heartbeat(
+    axum::extract::State(db): axum::extract::State<Arc<Db>>,
+    headers: axum::http::HeaderMap,
+    axum::Json(req): axum::Json<HeartbeatReq>,
+) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    check_token(&headers)?;
+    db.join(&req.room, &req.name, &req.harness, &req.machine, "owner")
+        .map_err(|_| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "heartbeat failed".into()))?;
+    Ok(axum::Json(json!({ "ok": true })))
+}
+
+#[derive(serde::Deserialize)]
+struct RenameReq {
+    room: String,
+    old: String,
+    new: String,
+}
+
+async fn http_rename(
+    axum::extract::State(db): axum::extract::State<Arc<Db>>,
+    headers: axum::http::HeaderMap,
+    axum::Json(req): axum::Json<RenameReq>,
+) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    check_token(&headers)?;
+    let n = db
+        .rename_agent(&req.room, &req.old, &req.new)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(axum::Json(json!({ "renamed": n })))
+}
+
+#[derive(serde::Deserialize)]
 struct UsageReq {
     machine: String,
     harness: String,
@@ -878,6 +927,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/kick", axum::routing::post(http_kick))
         .route("/delroom", axum::routing::post(http_delroom))
         .route("/usage", axum::routing::get(http_usage_get).post(http_usage_post))
+        .route("/heartbeat", axum::routing::post(http_heartbeat))
+        .route("/rename", axum::routing::post(http_rename))
         .route("/wakeable", axum::routing::get(http_wakeable))
         .with_state(db_state)
         .nest_service("/mcp", service);

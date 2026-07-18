@@ -3,7 +3,7 @@
 //! expand). Right: peers. Bottom: input.
 //! Keys: Tab feed/messages, Enter send (or toggle expand when input empty and
 //! a message is selected), ↑/↓ select, Esc clear, q / Ctrl-C quit.
-//! Slash commands: /rooms /room <name> /move <agent> <room> /name <me>
+//! Slash commands: /rooms /room /move /kick /spawn /usage /name <me>
 //! Env: AGORA_HUB, AGORA_ROOM, AGORA_NAME; token from ~/.agora-ingest-token.
 
 use std::collections::HashSet;
@@ -123,7 +123,17 @@ impl App {
         format!("{prefix}:{}", m["id"].as_i64().unwrap_or(0))
     }
 
+    fn heartbeat(&self) {
+        let payload = serde_json::json!({
+            "room": self.room, "name": self.name, "harness": "human-tui", "machine": "tui",
+        });
+        let _ = ureq::post(&format!("{}/heartbeat", self.hub))
+            .header("x-agora-token", &self.token)
+            .send_json(&payload);
+    }
+
     fn refresh(&mut self) {
+        self.heartbeat();
         if let Some(v) = get(&format!("{}/messages?room={}&limit=100", self.hub, self.room), &self.token) {
             self.messages = v["messages"].as_array().cloned().unwrap_or_default();
         }
@@ -330,11 +340,18 @@ impl App {
                 }
             }
             ("name", Some(n), _) => {
+                let old = self.name.clone();
+                let payload = serde_json::json!({ "room": self.room, "old": old, "new": n });
+                let _ = ureq::post(&format!("{}/rename", self.hub))
+                    .header("x-agora-token", &self.token)
+                    .send_json(&payload);
                 self.name = n.to_string();
                 if let Ok(home) = std::env::var("HOME") {
                     let _ = std::fs::write(format!("{home}/.agora-name"), &self.name);
                 }
-                self.status = format!("posting as {} (saved)", self.name);
+                self.heartbeat();
+                self.refresh();
+                self.status = format!("renamed to {} (saved)", self.name);
             }
             ("quit", _, _) => self.quit = true,
             ("spawn", Some(n), h) => {
@@ -607,13 +624,29 @@ fn main() -> io::Result<()> {
     let hub = std::env::var("AGORA_HUB").unwrap_or_else(|_| "http://100.84.87.107:8787".into());
     let room = std::env::var("AGORA_ROOM").unwrap_or_else(|_| "dev".into());
     let home_dir = std::env::var("HOME").unwrap_or_default();
-    let name = std::env::var("AGORA_NAME")
-        .ok()
-        .or_else(|| std::fs::read_to_string(format!("{home_dir}/.agora-name")).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()))
-        .unwrap_or_else(|| {
-            let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
-            format!("{user}-tui")
-        });
+    let name_file = format!("{home_dir}/.agora-name");
+    let name = match std::env::var("AGORA_NAME").ok().filter(|s| !s.trim().is_empty()) {
+        Some(n) => n,
+        None => match std::fs::read_to_string(&name_file).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+            Some(n) => n,
+            None => {
+                // first run: ask the user to pick a personal name
+                use std::io::Write;
+                let default = format!("{}-tui", std::env::var("USER").unwrap_or_else(|_| "user".into()));
+                print!("Welcome to agora. Pick a display name [{default}]: ");
+                let _ = std::io::stdout().flush();
+                let mut line = String::new();
+                let chosen = if std::io::stdin().read_line(&mut line).is_ok() {
+                    let t = line.trim();
+                    if t.is_empty() { default } else { t.to_string() }
+                } else {
+                    default
+                };
+                let _ = std::fs::write(&name_file, &chosen);
+                chosen
+            }
+        },
+    };
     let token = std::env::var("AGORA_INGEST_TOKEN").ok().or_else(|| {
         let home = std::env::var("HOME").ok()?;
         std::fs::read_to_string(format!("{home}/.agora-ingest-token")).ok()
