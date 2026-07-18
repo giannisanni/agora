@@ -18,6 +18,16 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 
 const COLLAPSE_AT: usize = 5; // bodies longer than this collapse to 4 + hint
 
+// (name, args hint, description) — powers the / autocomplete popup
+const COMMANDS: &[(&str, &str, &str)] = &[
+    ("help", "", "Show available commands"),
+    ("rooms", "", "List all rooms with agent/message counts"),
+    ("room", "<name>", "Switch to a room (creates it on first post)"),
+    ("move", "<agent> <room>", "Move an agent from this room to another"),
+    ("name", "<me>", "Change the name you post as"),
+    ("quit", "", "Exit the TUI"),
+];
+
 struct App {
     hub: String,
     room: String,
@@ -33,6 +43,8 @@ struct App {
     selected: Option<usize>,     // index into current list (messages or feed)
     vis: Vec<(usize, u16, u16)>, // (msg index, y, height) of visible msgs, for click hit-testing
     msg_area: Rect,
+    suggest_idx: usize,
+    quit: bool,
 }
 
 fn get(url: &str, token: &str) -> Option<serde_json::Value> {
@@ -139,6 +151,30 @@ impl App {
         }
     }
 
+    /// Commands matching the partial "/xyz" being typed (popup contents).
+    fn suggestions(&self) -> Vec<&'static (&'static str, &'static str, &'static str)> {
+        let Some(rest) = self.input.strip_prefix('/') else { return vec![] };
+        if rest.contains(' ') {
+            return vec![];
+        }
+        COMMANDS.iter().filter(|(n, _, _)| n.starts_with(rest)).collect()
+    }
+
+    fn complete_suggestion(&mut self) -> bool {
+        let sugg = self.suggestions();
+        let Some(&&(name, args, _)) = sugg.get(self.suggest_idx.min(sugg.len().saturating_sub(1))) else {
+            return false;
+        };
+        if args.is_empty() {
+            // no-arg command: run immediately
+            self.input.clear();
+            self.command(name.to_string());
+        } else {
+            self.input = format!("/{name} ");
+        }
+        true
+    }
+
     fn command(&mut self, cmd: String) {
         let mut parts = cmd.split_whitespace();
         match (parts.next().unwrap_or(""), parts.next(), parts.next()) {
@@ -175,6 +211,7 @@ impl App {
                 self.name = n.to_string();
                 self.status = format!("posting as {}", self.name);
             }
+            ("quit", _, _) => self.quit = true,
             _ => self.status = "commands: /rooms  /room <name>  /move <agent> <room>  /name <me>".into(),
         }
     }
@@ -302,6 +339,7 @@ fn main() -> io::Result<()> {
         messages: vec![], feed: vec![], peers: vec![],
         input: String::new(), status: String::new(), show_feed: false,
         expanded: HashSet::new(), selected: None, vis: vec![], msg_area: Rect::default(),
+        suggest_idx: 0, quit: false,
     };
     app.refresh();
     app.status = format!(
@@ -376,6 +414,36 @@ fn main() -> io::Result<()> {
                 Paragraph::new(Span::styled(app.status.as_str(), Style::default().fg(Color::DarkGray))),
                 outer[2],
             );
+            // Claude Code-style slash popup above the input
+            let sugg = app.suggestions();
+            if !sugg.is_empty() {
+                let h = sugg.len() as u16;
+                let w = outer[1].width.min(72);
+                let area = Rect::new(outer[1].x, outer[1].y.saturating_sub(h), w, h);
+                f.render_widget(ratatui::widgets::Clear, area);
+                let typed = app.input.trim_start_matches('/');
+                let rows: Vec<Line> = sugg.iter().enumerate().map(|(i, (n, args, desc))| {
+                    let selected = i == app.suggest_idx.min(sugg.len() - 1);
+                    let row_style = if selected {
+                        Style::default().bg(Color::Rgb(40, 44, 56))
+                    } else {
+                        Style::default()
+                    };
+                    let cmd_col = format!("/{n} {args}");
+                    let mut spans = vec![
+                        Span::styled(format!("/{typed}"), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                        Span::styled(n[typed.len()..].to_string(), Style::default().fg(Color::Cyan)),
+                        Span::styled(format!(" {args}"), Style::default().fg(Color::DarkGray)),
+                        Span::raw(" ".repeat(24usize.saturating_sub(cmd_col.len()))),
+                        Span::styled((*desc).to_string(), Style::default().fg(Color::Gray)),
+                    ];
+                    for s in &mut spans {
+                        s.style = s.style.patch(row_style);
+                    }
+                    Line::from(spans).style(row_style)
+                }).collect();
+                f.render_widget(Paragraph::new(rows), area);
+            }
             f.set_cursor_position((
                 outer[1].x + 1 + app.input.chars().count() as u16,
                 outer[1].y + 1,
@@ -384,19 +452,34 @@ fn main() -> io::Result<()> {
 
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {
-                Event::Key(k) => match (k.code, k.modifiers) {
-                    (KeyCode::Char('c'), KeyModifiers::CONTROL) => break Ok(()),
-                    (KeyCode::Char('q'), m) if app.input.is_empty() && m.is_empty() => break Ok(()),
-                    (KeyCode::Tab, _) => { app.show_feed = !app.show_feed; app.selected = None; }
-                    (KeyCode::Enter, _) => app.send(),
-                    (KeyCode::Up, _) => app.select_move(-1),
-                    (KeyCode::Down, _) => app.select_move(1),
-                    (KeyCode::Esc, _) => {
-                        if app.input.is_empty() { app.selected = None; } else { app.input.clear(); }
+                Event::Key(k) => {
+                    let popup = !app.suggestions().is_empty();
+                    match (k.code, k.modifiers) {
+                        (KeyCode::Char('c'), KeyModifiers::CONTROL) => break Ok(()),
+                        (KeyCode::Char('q'), m) if app.input.is_empty() && m.is_empty() => break Ok(()),
+                        (KeyCode::Tab, _) if popup => { app.complete_suggestion(); }
+                        (KeyCode::Tab, _) => { app.show_feed = !app.show_feed; app.selected = None; }
+                        (KeyCode::Enter, _) if popup => { app.complete_suggestion(); }
+                        (KeyCode::Enter, _) => app.send(),
+                        (KeyCode::Up, _) if popup => {
+                            app.suggest_idx = app.suggest_idx.saturating_sub(1);
+                        }
+                        (KeyCode::Down, _) if popup => {
+                            app.suggest_idx = (app.suggest_idx + 1).min(app.suggestions().len().saturating_sub(1));
+                        }
+                        (KeyCode::Up, _) => app.select_move(-1),
+                        (KeyCode::Down, _) => app.select_move(1),
+                        (KeyCode::Esc, _) => {
+                            if app.input.is_empty() { app.selected = None; } else { app.input.clear(); }
+                        }
+                        (KeyCode::Backspace, _) => { app.input.pop(); app.suggest_idx = 0; }
+                        (KeyCode::Char(c), m) if m.is_empty() || m == KeyModifiers::SHIFT => {
+                            app.input.push(c);
+                            app.suggest_idx = 0;
+                        }
+                        _ => {}
                     }
-                    (KeyCode::Backspace, _) => { app.input.pop(); }
-                    (KeyCode::Char(c), m) if m.is_empty() || m == KeyModifiers::SHIFT => app.input.push(c),
-                    _ => {}
+                    if app.quit { break Ok(()); }
                 },
                 Event::Mouse(me) => {
                     if let MouseEventKind::Down(MouseButton::Left) = me.kind {
