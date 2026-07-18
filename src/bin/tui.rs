@@ -64,6 +64,7 @@ struct App {
     peers_focused: bool,              // ←/→ switches focus between panes
     peer_sel: usize,                  // keyboard-selected peer
     menu_sel: usize,                  // keyboard-selected menu item
+    orch_rx: Option<std::sync::mpsc::Receiver<String>>, // async orch result
 }
 
 #[derive(Clone, Copy)]
@@ -290,16 +291,27 @@ impl App {
         }
     }
 
+    /// Run orch in a BACKGROUND thread — a spawn/kill may shell out to ssh,
+    /// which can block for seconds; doing it inline froze the whole UI. The
+    /// render loop polls `orch_rx` for the result. stdin is /dev/null and both
+    /// streams are captured so nothing leaks onto the TUI.
     fn orch(&mut self, args: &[String]) {
         let bin = format!("{}/workspace/agora/target/release/orch", std::env::var("HOME").unwrap_or_default());
-        match std::process::Command::new(&bin).args(args).output() {
-            Ok(o) => {
-                let text = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
-                self.status = text.split_whitespace().collect::<Vec<_>>().join(" ");
-                self.refresh();
-            }
-            Err(e) => self.status = format!("orch failed: {e}"),
-        }
+        let args: Vec<String> = args.to_vec();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.orch_rx = Some(rx);
+        self.status = format!("running: {} …", args.join(" "));
+        std::thread::spawn(move || {
+            let out = std::process::Command::new(&bin)
+                .args(&args)
+                .stdin(std::process::Stdio::null())
+                .output();
+            let text = match out {
+                Ok(o) => format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)),
+                Err(e) => format!("orch failed: {e}"),
+            };
+            let _ = tx.send(text.split_whitespace().collect::<Vec<_>>().join(" "));
+        });
     }
 
     fn fetch_rooms(&mut self) {
@@ -468,7 +480,12 @@ impl App {
                     if h.contains('@') { args.extend(["--on".into(), h.into()]); }
                     else { args.extend(["--harness".into(), h.into()]); }
                 }
-                if let Some(host) = parts.next() { args.extend(["--on".into(), host.to_string()]); }
+                // 3rd arg is a remote host only if it's user@host; a bare machine
+                // name (e.g. this laptop) means "spawn locally", so ignore it.
+                if let Some(host) = parts.next() {
+                    if host.contains('@') { args.extend(["--on".into(), host.to_string()]); }
+                    else { self.status = format!("(ignoring '{host}': use user@host for remote; spawning locally)"); }
+                }
                 self.orch(&args);
             }
             ("agents", h, _) => {
@@ -823,6 +840,7 @@ fn main() -> io::Result<()> {
         rooms: vec![], peer_vis: vec![], peers_area: Rect::default(),
         peer_menu: None, menu_items: vec![],
         peers_focused: false, peer_sel: 0, menu_sel: 0,
+        orch_rx: None,
     };
     app.fetch_rooms();
     app.refresh();
@@ -1001,6 +1019,14 @@ fn main() -> io::Result<()> {
                     }
                 }
                 _ => {}
+            }
+        }
+        // collect a finished background orch command
+        if let Some(rx) = &app.orch_rx {
+            if let Ok(text) = rx.try_recv() {
+                app.status = text;
+                app.orch_rx = None;
+                app.refresh();
             }
         }
         if last_poll.elapsed() >= Duration::from_secs(2) {
