@@ -225,7 +225,7 @@ impl Db {
         let conn = self.0.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT name, harness, machine, status, unixepoch() - last_seen, id FROM agents
-             WHERE room = ?1 ORDER BY last_seen DESC",
+             WHERE room = ?1 ORDER BY id ASC",
         )?;
         let rows = stmt
             .query_map([room], |r| {

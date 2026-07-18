@@ -27,14 +27,15 @@ fn run(host: Option<&str>, script: &str) -> (bool, String) {
     }
 }
 
-fn join_prompt(name: &str, room: &str) -> String {
+fn join_prompt(name: &str, room: &str, harness: &str) -> String {
     format!(
-        "Join agora room \"{room}\" as \"{name}\" using the agora MCP tools. \
-         Write your agent_id to .agora-agent-id in your cwd. Set your status \
-         with set_status. Check your inbox and handle anything there. Then \
-         loop forever: park in wait_for_messages (timeout_secs 240), handle \
-         whatever arrives (reply, do tasks, update status), and park again. \
-         You are a resident agent; do not end your turn."
+        "Join agora: call join_room with room=\"{room}\", name=\"{name}\", and \
+         harness=\"{harness}\" (always pass the harness field). Write your \
+         agent_id to .agora-agent-id in your cwd. Set your status with \
+         set_status. Check your inbox and handle anything there. Then loop \
+         forever: park in wait_for_messages (timeout_secs 600), handle whatever \
+         arrives (reply, do tasks, update status), and park again. You are a \
+         resident agent; do not end your turn."
     )
 }
 
@@ -75,7 +76,7 @@ fn main() {
                 "opencode" => format!("opencode run{m}"),
                 other => other.to_string(),
             };
-            let prompt = join_prompt(&name, &room).replace('"', "\\\"");
+            let prompt = join_prompt(&name, &room, &harness).replace('"', "\\\"");
             let script = format!(
                 "mkdir -p ~/agora-agents/{name} && cd ~/agora-agents/{name} && \
                  printf '%s %s\\n' '{harness}' '{room}' > .agora-spawn && \

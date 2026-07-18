@@ -508,23 +508,34 @@ impl App {
         self.peers_area = area;
         self.peer_vis.clear();
         self.menu_items.clear();
+        let w = area.width as usize;
+        // clip to panel width so nothing overflows the border
+        let clip = |s: &str, reserve: usize| -> String {
+            let max = w.saturating_sub(reserve);
+            if s.chars().count() <= max { s.to_string() }
+            else { s.chars().take(max.saturating_sub(1)).collect::<String>() + "…" }
+        };
         let mut out: Vec<Line> = Vec::new();
         let mut y = area.y;
         for (idx, p) in self.peers.iter().enumerate() {
             let name = p["name"].as_str().unwrap_or("?").to_string();
             let harness = p["harness"].as_str().unwrap_or("").to_string();
+            let harness = if harness.is_empty() { "unknown".to_string() } else { harness };
             let status = p["status"].as_str().unwrap_or("").to_string();
             let idle = p["idle_secs"].as_i64().unwrap_or(0);
             let dot = if idle < 120 { Span::styled("● ", Style::default().fg(Color::Green)) }
                       else { Span::styled("○ ", Style::default().fg(Color::DarkGray)) };
-            let mut first = vec![dot, Span::styled(name, Style::default().add_modifier(Modifier::BOLD))];
-            if self.peers_focused && self.peer_sel == idx && self.peer_menu.is_none() {
+            // ● + optional ▶ marker take ~2-3 cols
+            let sel = self.peers_focused && self.peer_sel == idx && self.peer_menu.is_none();
+            let name_reserve = if sel { 4 } else { 2 };
+            let mut first = vec![dot, Span::styled(clip(&name, name_reserve), Style::default().add_modifier(Modifier::BOLD))];
+            if sel {
                 first.insert(0, Span::styled("▶", Style::default().fg(Color::White)));
             }
             let mut lines = vec![Line::from(first)];
             let sub = if status.is_empty() { harness } else { format!("{harness} · {status}") };
             if !sub.is_empty() {
-                lines.push(Line::from(Span::styled(format!("  {sub}"), Style::default().fg(Color::DarkGray))));
+                lines.push(Line::from(Span::styled(format!("  {}", clip(&sub, 2)), Style::default().fg(Color::DarkGray))));
             }
             let h = lines.len() as u16;
             if y + h > area.y + area.height { break; }
