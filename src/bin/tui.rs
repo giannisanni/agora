@@ -26,7 +26,7 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("move", "<agent> <room>", "Move an agent from this room to another"),
     ("name", "<me>", "Change the name you post as"),
     ("kick", "<agent> [agent...]", "Remove agent(s) from this room"),
-    ("spawn", "<name> [harness] [host]", "Spawn a resident agent in tmux (here or user@host)"),
+    ("spawn", "<name> [harness] [user@host] [model:ID]", "Spawn a resident agent (harness/host/model any order)"),
     ("agents", "", "List spawned tmux agents"),
     ("killagent", "<name> [host]", "Kill a spawned tmux agent"),
     ("restart", "<name> [host]", "Restart a spawned tmux agent"),
@@ -474,17 +474,19 @@ impl App {
             ("idle", Some(agent), _) => {
                 self.dm_control(agent, "[control] Stand down: finish any pending messages, then STOP looping and end your turn (go idle). The operator's wake shim will bring you back when new mail arrives.");
             }
-            ("spawn", Some(n), h) => {
+            ("spawn", Some(n), _) => {
+                // /spawn <name> [harness] [user@host] [model:<id>] — tokens are
+                // recognized by shape: contains '@' = host, "model:" = model,
+                // otherwise = harness. Order-independent.
                 let mut args = vec!["spawn".to_string(), n.to_string(), "--room".into(), self.room.clone()];
-                if let Some(h) = h {
-                    if h.contains('@') { args.extend(["--on".into(), h.into()]); }
-                    else { args.extend(["--harness".into(), h.into()]); }
-                }
-                // 3rd arg is a remote host only if it's user@host; a bare machine
-                // name (e.g. this laptop) means "spawn locally", so ignore it.
-                if let Some(host) = parts.next() {
-                    if host.contains('@') { args.extend(["--on".into(), host.to_string()]); }
-                    else { self.status = format!("(ignoring '{host}': use user@host for remote; spawning locally)"); }
+                for tok in cmd.split_whitespace().skip(2) {
+                    if let Some(mdl) = tok.strip_prefix("model:") {
+                        args.extend(["--model".into(), mdl.to_string()]);
+                    } else if tok.contains('@') {
+                        args.extend(["--on".into(), tok.to_string()]);
+                    } else {
+                        args.extend(["--harness".into(), tok.to_string()]);
+                    }
                 }
                 self.orch(&args);
             }
