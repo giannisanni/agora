@@ -45,12 +45,14 @@ fn main() {
     let mut harness = "claude".to_string();
     let mut room = "dev".to_string();
     let mut host: Option<String> = None;
+    let mut model: Option<String> = None;
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--harness" => harness = it.next().cloned().unwrap_or(harness),
             "--room" => room = it.next().cloned().unwrap_or(room),
             "--on" => host = it.next().cloned(),
+            "--model" => model = it.next().cloned(),
             other if name.is_empty() => name = other.to_string(),
             _ => {}
         }
@@ -63,10 +65,15 @@ fn main() {
                 eprintln!("usage: orch spawn <name> [--harness claude|codex] [--room r] [--on user@host]");
                 std::process::exit(1);
             }
+            // per-harness launch command; --model appended only when given, so
+            // each harness otherwise uses its own configured default model.
+            let m = model.as_deref().map(|m| format!(" --model {m}")).unwrap_or_default();
+            let m_codex = model.as_deref().map(|m| format!(" -m {m}")).unwrap_or_default();
             let bin = match harness.as_str() {
-                "claude" | "claude-code" => "claude",
-                "codex" => "codex",
-                other => other, // any CLI that takes a prompt argument
+                "claude" | "claude-code" => format!("claude{m}"),
+                "codex" => format!("codex{m_codex}"),
+                "opencode" => format!("opencode run{m}"),
+                other => other.to_string(),
             };
             let prompt = join_prompt(&name, &room).replace('"', "\\\"");
             let script = format!(
