@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use rmcp::{
     ErrorData as McpError, ServerHandler,
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    handler::server::{router::tool::ToolRouter, tool::Extension, wrapper::Parameters},
     model::*,
     tool, tool_handler, tool_router,
     transport::streamable_http_server::{
@@ -11,6 +11,32 @@ use rmcp::{
 };
 use rusqlite::Connection;
 use serde_json::json;
+
+type Parts = axum::http::request::Parts;
+
+#[derive(Debug)]
+enum AgoraErr {
+    Db(rusqlite::Error),
+    Denied,
+}
+
+impl From<rusqlite::Error> for AgoraErr {
+    fn from(e: rusqlite::Error) -> Self {
+        AgoraErr::Db(e)
+    }
+}
+
+/// Caller identity: the Tailscale-User-Login header stamped by `tailscale
+/// serve` for proxied traffic. Direct tailnet connections (no header) are the
+/// owner — the direct port must be ACL-restricted to the owner's own devices.
+fn caller(parts: &Parts) -> String {
+    parts
+        .headers
+        .get("tailscale-user-login")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("owner")
+        .to_string()
+}
 
 // ponytail: one Mutex<Connection>, all DB ops sync. Per-room locks if this ever has real load.
 struct Db(Mutex<Connection>);
@@ -52,6 +78,7 @@ impl Db {
         // lazy migrations; harmless errors if columns exist
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL DEFAULT 'msg'", []);
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN source_id TEXT", []);
+        let _ = conn.execute("ALTER TABLE agents ADD COLUMN user TEXT NOT NULL DEFAULT 'owner'", []);
         conn.execute_batch(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_source
              ON messages(room, source_id) WHERE source_id IS NOT NULL;",
@@ -66,12 +93,24 @@ impl Db {
         );
     }
 
-    fn join(&self, room: &str, name: &str, harness: &str, machine: &str) -> rusqlite::Result<(i64, Vec<serde_json::Value>)> {
+    fn join(&self, room: &str, name: &str, harness: &str, machine: &str, user: &str) -> Result<(i64, Vec<serde_json::Value>), AgoraErr> {
         let conn = self.0.lock().unwrap();
+        // a room name belongs to whoever first claimed it
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT user FROM agents WHERE room = ?1 AND name = ?2",
+                (room, name),
+                |r| r.get(0),
+            )
+            .map(Some)
+            .or_else(|e| if e == rusqlite::Error::QueryReturnedNoRows { Ok(None) } else { Err(e) })?;
+        if existing.is_some_and(|u| u != user) {
+            return Err(AgoraErr::Denied);
+        }
         conn.execute(
-            "INSERT INTO agents(room, name, harness, machine, last_seen) VALUES(?1, ?2, ?3, ?4, unixepoch())
+            "INSERT INTO agents(room, name, harness, machine, user, last_seen) VALUES(?1, ?2, ?3, ?4, ?5, unixepoch())
              ON CONFLICT(room, name) DO UPDATE SET harness = ?3, machine = ?4, last_seen = unixepoch()",
-            (room, name, harness, machine),
+            (room, name, harness, machine, user),
         )?;
         let id: i64 = conn.query_row(
             "SELECT id FROM agents WHERE room = ?1 AND name = ?2",
@@ -83,8 +122,17 @@ impl Db {
         Ok((id, backlog))
     }
 
-    fn post(&self, agent_id: i64, text: &str, to: Option<&str>, kind: &str, source_id: Option<&str>) -> rusqlite::Result<(i64, bool)> {
+    /// The caller may act as this agent only if they created it.
+    fn verify(conn: &Connection, agent_id: i64, user: &str) -> Result<(), AgoraErr> {
+        let owner: String = conn
+            .query_row("SELECT user FROM agents WHERE id = ?1", [agent_id], |r| r.get(0))
+            .map_err(|e| if e == rusqlite::Error::QueryReturnedNoRows { AgoraErr::Denied } else { e.into() })?;
+        if owner != user { Err(AgoraErr::Denied) } else { Ok(()) }
+    }
+
+    fn post(&self, agent_id: i64, user: &str, text: &str, to: Option<&str>, kind: &str, source_id: Option<&str>) -> Result<(i64, bool), AgoraErr> {
         let conn = self.0.lock().unwrap();
+        Self::verify(&conn, agent_id, user)?;
         let (room, name): (String, String) = conn.query_row(
             "SELECT room, name FROM agents WHERE id = ?1",
             [agent_id],
@@ -110,8 +158,9 @@ impl Db {
         Ok((id, true))
     }
 
-    fn inbox(&self, agent_id: i64) -> rusqlite::Result<Vec<serde_json::Value>> {
+    fn inbox(&self, agent_id: i64, user: &str) -> Result<Vec<serde_json::Value>, AgoraErr> {
         let conn = self.0.lock().unwrap();
+        Self::verify(&conn, agent_id, user)?;
         let (room, name, cursor): (String, String, i64) = conn.query_row(
             "SELECT room, name, cursor FROM agents WHERE id = ?1",
             [agent_id],
@@ -202,8 +251,9 @@ impl Db {
         Ok(rows)
     }
 
-    fn set_status(&self, agent_id: i64, status: &str) -> rusqlite::Result<()> {
+    fn set_status(&self, agent_id: i64, user: &str, status: &str) -> Result<(), AgoraErr> {
         let conn = self.0.lock().unwrap();
+        Self::verify(&conn, agent_id, user)?;
         conn.execute("UPDATE agents SET status = ?1 WHERE id = ?2", (status, agent_id))?;
         Self::touch(&conn, agent_id);
         Ok(())
@@ -212,6 +262,16 @@ impl Db {
 
 fn db_err(e: rusqlite::Error) -> McpError {
     McpError::internal_error(e.to_string(), None)
+}
+
+fn agora_err(e: AgoraErr) -> McpError {
+    match e {
+        AgoraErr::Db(e) => db_err(e),
+        AgoraErr::Denied => McpError::invalid_params(
+            "denied: this agent name/id belongs to another user".to_string(),
+            None,
+        ),
+    }
 }
 
 fn ok_json(v: serde_json::Value) -> CallToolResult {
@@ -300,18 +360,29 @@ impl Agora {
     }
 
     #[tool(description = "Join a room (rejoin-safe). Returns your agent_id and unseen backlog. Use the agent_id in all other tools.")]
-    fn join_room(&self, Parameters(p): Parameters<JoinParams>) -> Result<CallToolResult, McpError> {
-        let (id, backlog) = self.db.join(&p.room, &p.name, &p.harness, &p.machine).map_err(db_err)?;
+    fn join_room(
+        &self,
+        Parameters(p): Parameters<JoinParams>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let (id, backlog) = self
+            .db
+            .join(&p.room, &p.name, &p.harness, &p.machine, &caller(&parts))
+            .map_err(agora_err)?;
         Ok(ok_json(json!({ "agent_id": id, "backlog": backlog })))
     }
 
     #[tool(description = "Post to your room. Broadcast by default; set `to` for a targeted message. Inbox kinds (msg/task/handoff/question/blocker) deliver to recipients; feed kinds (feed/summary/status/finding/decision/file_changed/test_result/review_finding) are ambient. source_id makes the post idempotent.")]
-    fn post(&self, Parameters(p): Parameters<PostParams>) -> Result<CallToolResult, McpError> {
+    fn post(
+        &self,
+        Parameters(p): Parameters<PostParams>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, McpError> {
         let kind = p.kind.as_deref().unwrap_or("msg");
         let (id, new) = self
             .db
-            .post(p.agent_id, &p.text, p.to.as_deref(), kind, p.source_id.as_deref())
-            .map_err(db_err)?;
+            .post(p.agent_id, &caller(&parts), &p.text, p.to.as_deref(), kind, p.source_id.as_deref())
+            .map_err(agora_err)?;
         Ok(ok_json(json!({ "message_id": id, "new": new })))
     }
 
@@ -322,11 +393,16 @@ impl Agora {
     }
 
     #[tool(description = "Block until a message arrives for you (or timeout), then return it like inbox. Terminal-agnostic wake: call this when idle and waiting for another agent.")]
-    async fn wait_for_messages(&self, Parameters(p): Parameters<WaitParams>) -> Result<CallToolResult, McpError> {
+    async fn wait_for_messages(
+        &self,
+        Parameters(p): Parameters<WaitParams>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let user = caller(&parts);
         let timeout = p.timeout_secs.unwrap_or(60).min(300);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
         loop {
-            let msgs = self.db.inbox(p.agent_id).map_err(db_err)?;
+            let msgs = self.db.inbox(p.agent_id, &user).map_err(agora_err)?;
             if !msgs.is_empty() || std::time::Instant::now() >= deadline {
                 return Ok(ok_json(json!({ "messages": msgs })));
             }
@@ -335,8 +411,12 @@ impl Agora {
     }
 
     #[tool(description = "Fetch messages you have not seen yet (each message is delivered exactly once). Call at the start of every turn.")]
-    fn inbox(&self, Parameters(p): Parameters<AgentParams>) -> Result<CallToolResult, McpError> {
-        let msgs = self.db.inbox(p.agent_id).map_err(db_err)?;
+    fn inbox(
+        &self,
+        Parameters(p): Parameters<AgentParams>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let msgs = self.db.inbox(p.agent_id, &caller(&parts)).map_err(agora_err)?;
         Ok(ok_json(json!({ "messages": msgs })))
     }
 
@@ -347,8 +427,12 @@ impl Agora {
     }
 
     #[tool(description = "Set your one-line status, visible to peers.")]
-    fn set_status(&self, Parameters(p): Parameters<StatusParams>) -> Result<CallToolResult, McpError> {
-        self.db.set_status(p.agent_id, &p.status).map_err(db_err)?;
+    fn set_status(
+        &self,
+        Parameters(p): Parameters<StatusParams>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        self.db.set_status(p.agent_id, &caller(&parts), &p.status).map_err(agora_err)?;
         Ok(ok_json(json!({ "ok": true })))
     }
 }
@@ -381,15 +465,25 @@ struct IngestReq {
     source_id: Option<String>,
 }
 
-// plain HTTP door for the scribe daemon; tailnet-only like everything else
+// plain HTTP door for the scribe daemon, gated by a shared secret
 async fn ingest(
     axum::extract::State(db): axum::extract::State<Arc<Db>>,
+    headers: axum::http::HeaderMap,
     axum::Json(req): axum::Json<IngestReq>,
 ) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, String)> {
-    let err = |e: rusqlite::Error| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
-    let (agent_id, _) = db.join(&req.room, &req.name, &req.harness, &req.machine).map_err(err)?;
+    use axum::http::StatusCode;
+    let expected = std::env::var("AGORA_INGEST_TOKEN").unwrap_or_default();
+    let given = headers.get("x-agora-token").and_then(|v| v.to_str().ok()).unwrap_or("");
+    if expected.is_empty() || given != expected {
+        return Err((StatusCode::FORBIDDEN, "bad or missing x-agora-token".into()));
+    }
+    let err = |e: AgoraErr| match e {
+        AgoraErr::Db(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        AgoraErr::Denied => (StatusCode::FORBIDDEN, "name belongs to another user".into()),
+    };
+    let (agent_id, _) = db.join(&req.room, &req.name, &req.harness, &req.machine, "owner").map_err(err)?;
     let (id, new) = db
-        .post(agent_id, &req.body, None, req.kind.as_deref().unwrap_or("summary"), req.source_id.as_deref())
+        .post(agent_id, "owner", &req.body, None, req.kind.as_deref().unwrap_or("summary"), req.source_id.as_deref())
         .map_err(err)?;
     Ok(axum::Json(json!({ "message_id": id, "new": new })))
 }
@@ -440,48 +534,48 @@ mod tests {
     #[test]
     fn exactly_once_delivery() {
         let db = mem();
-        let (a, _) = db.join("r", "alice", "", "").unwrap();
-        let (b, _) = db.join("r", "bob", "", "").unwrap();
+        let (a, _) = db.join("r", "alice", "", "", "owner").unwrap();
+        let (b, _) = db.join("r", "bob", "", "", "owner").unwrap();
 
-        db.post(a, "hi bob", None, "msg", None).unwrap();
-        let got = db.inbox(b).unwrap();
+        db.post(a, "owner", "hi bob", None, "msg", None).unwrap();
+        let got = db.inbox(b, "owner").unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0]["body"], "hi bob");
         // second read: nothing new, no duplicates (the Mosaic flaw)
-        assert!(db.inbox(b).unwrap().is_empty());
+        assert!(db.inbox(b, "owner").unwrap().is_empty());
         // sender never sees own message
-        assert!(db.inbox(a).unwrap().is_empty());
+        assert!(db.inbox(a, "owner").unwrap().is_empty());
     }
 
     #[test]
     fn targeted_messages_skip_others() {
         let db = mem();
-        let (a, _) = db.join("r", "alice", "", "").unwrap();
-        let (b, _) = db.join("r", "bob", "", "").unwrap();
-        let (c, _) = db.join("r", "carol", "", "").unwrap();
+        let (a, _) = db.join("r", "alice", "", "", "owner").unwrap();
+        let (b, _) = db.join("r", "bob", "", "", "owner").unwrap();
+        let (c, _) = db.join("r", "carol", "", "", "owner").unwrap();
 
-        db.post(a, "for bob only", Some("bob"), "msg", None).unwrap();
-        assert_eq!(db.inbox(b).unwrap().len(), 1);
-        assert!(db.inbox(c).unwrap().is_empty());
+        db.post(a, "owner", "for bob only", Some("bob"), "msg", None).unwrap();
+        assert_eq!(db.inbox(b, "owner").unwrap().len(), 1);
+        assert!(db.inbox(c, "owner").unwrap().is_empty());
         // carol's cursor advanced past the filtered message; nothing re-delivers later
-        assert!(db.inbox(c).unwrap().is_empty());
+        assert!(db.inbox(c, "owner").unwrap().is_empty());
     }
 
     #[test]
     fn rejoin_keeps_cursor_and_backlog_shows_unseen() {
         let db = mem();
-        let (a, _) = db.join("r", "alice", "", "").unwrap();
-        let (b, _) = db.join("r", "bob", "", "").unwrap();
-        db.post(a, "one", None, "msg", None).unwrap();
-        assert_eq!(db.inbox(b).unwrap().len(), 1);
-        db.post(a, "two", None, "msg", None).unwrap();
+        let (a, _) = db.join("r", "alice", "", "", "owner").unwrap();
+        let (b, _) = db.join("r", "bob", "", "", "owner").unwrap();
+        db.post(a, "owner", "one", None, "msg", None).unwrap();
+        assert_eq!(db.inbox(b, "owner").unwrap().len(), 1);
+        db.post(a, "owner", "two", None, "msg", None).unwrap();
 
         // bob rejoins (new session): same id preserved, cursor intact,
         // inbox still delivers only the unseen "two"
-        let (b2, backlog) = db.join("r", "bob", "codex", "mac").unwrap();
+        let (b2, backlog) = db.join("r", "bob", "codex", "mac", "owner").unwrap();
         assert_eq!(b, b2);
         assert!(!backlog.is_empty());
-        let got = db.inbox(b).unwrap();
+        let got = db.inbox(b, "owner").unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0]["body"], "two");
     }
@@ -489,14 +583,14 @@ mod tests {
     #[test]
     fn feed_is_ambient_not_inbox() {
         let db = mem();
-        let (a, _) = db.join("r", "alice", "", "").unwrap();
-        let (b, _) = db.join("r", "bob", "", "").unwrap();
+        let (a, _) = db.join("r", "alice", "", "", "owner").unwrap();
+        let (b, _) = db.join("r", "bob", "", "", "owner").unwrap();
 
-        db.post(a, "turn 1: refactoring auth", None, "feed", None).unwrap();
-        db.post(a, "hey bob, need review", None, "msg", None).unwrap();
+        db.post(a, "owner", "turn 1: refactoring auth", None, "feed", None).unwrap();
+        db.post(a, "owner", "hey bob, need review", None, "msg", None).unwrap();
 
         // inbox delivers only the msg, never feed entries
-        let got = db.inbox(b).unwrap();
+        let got = db.inbox(b, "owner").unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0]["body"], "hey bob, need review");
 
@@ -511,11 +605,11 @@ mod tests {
     #[test]
     fn source_id_is_idempotent() {
         let db = mem();
-        let (a, _) = db.join("r", "alice", "", "").unwrap();
-        let (b, _) = db.join("r", "bob", "", "").unwrap();
+        let (a, _) = db.join("r", "alice", "", "", "owner").unwrap();
+        let (b, _) = db.join("r", "bob", "", "", "owner").unwrap();
 
-        let (m1, n1) = db.post(a, "turn text", None, "summary", Some("uuid-1")).unwrap();
-        let (m2, n2) = db.post(a, "turn text", None, "summary", Some("uuid-1")).unwrap();
+        let (m1, n1) = db.post(a, "owner", "turn text", None, "summary", Some("uuid-1")).unwrap();
+        let (m2, n2) = db.post(a, "owner", "turn text", None, "summary", Some("uuid-1")).unwrap();
         assert_eq!(m1, m2); assert!(n1); assert!(!n2); // scribe can re-scan transcripts safely
         assert_eq!(db.feed("r", None, 20).unwrap().len(), 1);
         let _ = b;
@@ -524,14 +618,14 @@ mod tests {
     #[test]
     fn kind_classes_route_correctly() {
         let db = mem();
-        let (a, _) = db.join("r", "alice", "", "").unwrap();
-        let (b, _) = db.join("r", "bob", "", "").unwrap();
+        let (a, _) = db.join("r", "alice", "", "", "owner").unwrap();
+        let (b, _) = db.join("r", "bob", "", "", "owner").unwrap();
 
-        db.post(a, "urgent", Some("bob"), "blocker", None).unwrap();
-        db.post(a, "tests green", None, "test_result", None).unwrap();
+        db.post(a, "owner", "urgent", Some("bob"), "blocker", None).unwrap();
+        db.post(a, "owner", "tests green", None, "test_result", None).unwrap();
 
         // blocker -> inbox; test_result -> feed only
-        let got = db.inbox(b).unwrap();
+        let got = db.inbox(b, "owner").unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0]["kind"], "blocker");
         let f = db.feed("r", None, 20).unwrap();
@@ -540,10 +634,27 @@ mod tests {
     }
 
     #[test]
+    fn other_user_cannot_spoof_or_read() {
+        let db = mem();
+        let (a, _) = db.join("r", "alice", "", "", "gianni").unwrap();
+        db.post(a, "gianni", "private note", None, "msg", None).unwrap();
+
+        // friend can't act as alice's agent_id or claim her name
+        assert!(matches!(db.inbox(a, "friend"), Err(AgoraErr::Denied)));
+        assert!(matches!(db.post(a, "friend", "spoof", None, "msg", None), Err(AgoraErr::Denied)));
+        assert!(matches!(db.set_status(a, "friend", "x"), Err(AgoraErr::Denied)));
+        assert!(matches!(db.join("r", "alice", "", "", "friend"), Err(AgoraErr::Denied)));
+
+        // friend can join under their own name; owner rejoin still fine
+        assert!(db.join("r", "bob", "", "", "friend").is_ok());
+        assert!(db.join("r", "alice", "", "", "gianni").is_ok());
+    }
+
+    #[test]
     fn peers_and_status() {
         let db = mem();
-        let (a, _) = db.join("r", "alice", "claude-code", "mac").unwrap();
-        db.set_status(a, "building agora").unwrap();
+        let (a, _) = db.join("r", "alice", "claude-code", "mac", "owner").unwrap();
+        db.set_status(a, "owner", "building agora").unwrap();
         let peers = db.peers("r").unwrap();
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0]["status"], "building agora");

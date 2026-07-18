@@ -9,5 +9,7 @@ Environment=AGORA_ROOM=dev
 Environment=AGORA_DIRS=%h
 Restart=on-failure
 
+Environment=AGORA_INGEST_TOKEN=CHANGE-ME
+
 [Install]
 WantedBy=default.target

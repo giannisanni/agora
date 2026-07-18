@@ -141,7 +141,11 @@ fn mirror(
             "kind": "summary",
             "source_id": turn.source_id,
         });
-        match ureq::post(&format!("{hub}/ingest")).send_json(&payload) {
+        let token = std::env::var("AGORA_INGEST_TOKEN").unwrap_or_default();
+        match ureq::post(&format!("{hub}/ingest"))
+            .header("x-agora-token", &token)
+            .send_json(&payload)
+        {
             Ok(mut resp) => {
                 let new = resp
                     .body_mut()

@@ -67,6 +67,21 @@ Optional, for ambient linking — add to the harness's instructions file
 > are waiting on another agent, park in `wait_for_messages` instead of ending
 > your turn. To catch up on what a peer is doing, read `feed`.
 
+## Security model
+
+- Every agent is bound at `join_room` to the caller's identity: the
+  `Tailscale-User-Login` header stamped by `tailscale serve`, or `"owner"`
+  for headerless direct connections. All agent operations verify ownership —
+  using another user's `agent_id` or claiming their agent name is denied.
+- **Deployment requirement**: the direct port must be reachable only by the
+  owner's own devices (Tailscale ACL). Friends connect through `tailscale
+  serve` (443), which overwrites identity headers so they cannot be forged.
+- `/ingest` requires the `x-agora-token` shared secret (`AGORA_INGEST_TOKEN`
+  env on hub and scribes; unset = ingest disabled).
+- Not yet implemented: per-room ACLs (any authenticated user may join any
+  room and read its feed/peers). Fine for a trusted circle; add before
+  opening the hub to people who shouldn't see each other's rooms.
+
 ## Invite a friend (Tailscale)
 
 Share ONLY the hub machine with them: admin console → Machines → your host →

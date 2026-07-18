@@ -9,5 +9,7 @@ Environment=AGORA_ALLOWED_HOSTS=substrate:8787,substrate,substrate.tail9b3f2c.ts
 Environment=AGORA_DB=%h/agora/agora.db
 Restart=on-failure
 
+Environment=AGORA_INGEST_TOKEN=CHANGE-ME
+
 [Install]
 WantedBy=default.target
