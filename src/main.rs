@@ -240,6 +240,30 @@ impl Db {
         Ok(n)
     }
 
+    // observer view for the TUI: recent inbox-class traffic, no cursor effects
+    fn recent_messages(&self, room: &str, limit: i64) -> rusqlite::Result<Vec<serde_json::Value>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, sender, recipient, body, created, kind FROM messages
+             WHERE room = ?1 AND kind NOT IN ({FEED_KINDS})
+             ORDER BY id DESC LIMIT ?2",
+        ))?;
+        let mut rows: Vec<serde_json::Value> = stmt
+            .query_map((room, limit), |r| {
+                Ok(json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "from": r.get::<_, String>(1)?,
+                    "to": r.get::<_, Option<String>>(2)?,
+                    "body": r.get::<_, String>(3)?,
+                    "at": r.get::<_, i64>(4)?,
+                    "kind": r.get::<_, String>(5)?,
+                }))
+            })?
+            .collect::<Result<_, _>>()?;
+        rows.reverse();
+        Ok(rows)
+    }
+
     // feed reads never touch cursors: ambient visibility is pull-on-demand
     fn feed(&self, room: &str, from: Option<&str>, limit: i64) -> rusqlite::Result<Vec<serde_json::Value>> {
         let conn = self.0.lock().unwrap();
@@ -483,6 +507,60 @@ struct IngestReq {
     kind: Option<String>,
     #[serde(default)]
     source_id: Option<String>,
+    #[serde(default)]
+    to: Option<String>,
+}
+
+fn check_token(headers: &axum::http::HeaderMap) -> Result<(), (axum::http::StatusCode, String)> {
+    let expected = std::env::var("AGORA_INGEST_TOKEN").unwrap_or_default();
+    let given = headers.get("x-agora-token").and_then(|v| v.to_str().ok()).unwrap_or("");
+    if expected.is_empty() || given != expected {
+        return Err((axum::http::StatusCode::FORBIDDEN, "bad or missing x-agora-token".into()));
+    }
+    Ok(())
+}
+
+// read endpoints for the TUI (token-gated, owner-tools on the trusted network)
+async fn http_feed(
+    axum::extract::State(db): axum::extract::State<Arc<Db>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    check_token(&headers)?;
+    let room = q.get("room").cloned().unwrap_or_else(|| "dev".into());
+    let limit: i64 = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(50);
+    let feed = db
+        .feed(&room, q.get("from").map(|s| s.as_str()), limit)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(axum::Json(json!({ "feed": feed })))
+}
+
+async fn http_peers(
+    axum::extract::State(db): axum::extract::State<Arc<Db>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    check_token(&headers)?;
+    let room = q.get("room").cloned().unwrap_or_else(|| "dev".into());
+    let peers = db
+        .peers(&room)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(axum::Json(json!({ "peers": peers })))
+}
+
+// recent inbox-class messages in a room, without cursor effects (TUI timeline)
+async fn http_messages(
+    axum::extract::State(db): axum::extract::State<Arc<Db>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    check_token(&headers)?;
+    let room = q.get("room").cloned().unwrap_or_else(|| "dev".into());
+    let limit: i64 = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(50);
+    let msgs = db
+        .recent_messages(&room, limit)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(axum::Json(json!({ "messages": msgs })))
 }
 
 // non-consuming unread count, for turn-boundary hooks ("should I check inbox
@@ -515,18 +593,14 @@ async fn ingest(
     axum::Json(req): axum::Json<IngestReq>,
 ) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, String)> {
     use axum::http::StatusCode;
-    let expected = std::env::var("AGORA_INGEST_TOKEN").unwrap_or_default();
-    let given = headers.get("x-agora-token").and_then(|v| v.to_str().ok()).unwrap_or("");
-    if expected.is_empty() || given != expected {
-        return Err((StatusCode::FORBIDDEN, "bad or missing x-agora-token".into()));
-    }
+    check_token(&headers)?;
     let err = |e: AgoraErr| match e {
         AgoraErr::Db(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         AgoraErr::Denied => (StatusCode::FORBIDDEN, "name belongs to another user".into()),
     };
     let (agent_id, _) = db.join(&req.room, &req.name, &req.harness, &req.machine, "owner").map_err(err)?;
     let (id, new) = db
-        .post(agent_id, "owner", &req.body, None, req.kind.as_deref().unwrap_or("summary"), req.source_id.as_deref())
+        .post(agent_id, "owner", &req.body, req.to.as_deref(), req.kind.as_deref().unwrap_or("summary"), req.source_id.as_deref())
         .map_err(err)?;
     Ok(axum::Json(json!({ "message_id": id, "new": new })))
 }
@@ -557,6 +631,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let router = axum::Router::new()
         .route("/ingest", axum::routing::post(ingest))
         .route("/unread", axum::routing::get(unread))
+        .route("/feed", axum::routing::get(http_feed))
+        .route("/peers", axum::routing::get(http_peers))
+        .route("/messages", axum::routing::get(http_messages))
         .with_state(db_state)
         .nest_service("/mcp", service);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
