@@ -154,6 +154,8 @@ fn main() {
                  printf '%s' {prompt_q} > prompt.txt && \
                  printf '%s' {run_q} > run.sh && \
                  tmux new-session -d -s agora-{name} 'bash run.sh' && \
+                 tmux set-option -g exit-empty off 2>/dev/null; \
+                 tmux set-option -g exit-unattached off 2>/dev/null; \
                  echo spawned agora-{name}",
                 prompt_q = sh_squote(&prompt),
                 run_q = sh_squote(&run_sh),
