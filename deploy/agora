@@ -1,13 +1,14 @@
 #!/bin/bash
-# agora dispatcher: `agora` or `agora tui` = TUI, `agora hub` = server,
-# `agora scribe` = transcript mirror. Binaries from the repo's release build.
+# agora dispatcher: `agora` / `agora cli` = the interactive room command center,
+# `agora hub` = server, `agora scribe` = transcript mirror, `agora wake` = wake
+# shim, `agora spawn|kill|restart|agents` = fleet control.
 BIN="$HOME/workspace/agora/target/release"
 case "$1" in
-  tui)        shift; exec "$BIN/tui" "$@" ;;
+  cli|tui)    shift; exec "$BIN/tui" "$@" ;;
   hub|serve)  shift; exec "$BIN/agora" "$@" ;;
   scribe)     shift; exec "$BIN/scribe" "$@" ;;
   wake)       shift; exec "$BIN/wake" "$@" ;;
   spawn|kill|restart|agents) exec "$BIN/orch" "$@" ;;
   "")         exec "$BIN/tui" ;;
-  *)          echo "usage: agora [tui|hub|scribe|wake|spawn|kill|restart|agents]"; exit 1 ;;
+  *)          echo "usage: agora [cli|hub|scribe|wake|spawn|kill|restart|agents]"; exit 1 ;;
 esac

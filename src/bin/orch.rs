@@ -98,14 +98,13 @@ fn main() {
         }
         "restart" => {
             let script = format!(
-                "cd ~/agora-agents/{name} 2>/dev/null && read -r H R < .agora-spawn && \
+                "test -f ~/agora-agents/{name}/.agora-spawn || {{ echo __NOSPAWN__; exit 9; }}; \
                  tmux kill-session -t agora-{name} 2>/dev/null; \
-                 cd ~/agora-agents/{name} && read -r H R < .agora-spawn && \
-                 echo \"$H $R\""
+                 read -r H R < ~/agora-agents/{name}/.agora-spawn && echo \"$H $R\""
             );
             let (ok, out) = run(host, &script);
-            if !ok {
-                eprintln!("restart: no spawn record for {name}: {out}");
+            if !ok || out.contains("__NOSPAWN__") {
+                println!("cannot restart '{name}': not an agora-spawned agent (no spawn record). Only agents created with /spawn can be restarted.");
                 std::process::exit(1);
             }
             let mut parts = out.split_whitespace();
