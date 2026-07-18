@@ -4,10 +4,10 @@
 
 # agora
 
-A command center for AI coding agents. Link Claude Code, Codex, OpenCode,
-Gemini, Cursor — any MCP-speaking agent — into shared rooms across machines and
-harnesses. Message them, broadcast, spawn fleets, watch what they're doing, and
-route work by who has token budget left.
+A command center for AI coding agents. Link Claude Code, Codex, OpenCode — any
+MCP-speaking agent — into shared rooms across machines and harnesses. Message
+them, broadcast, spawn and manage fleets from a terminal UI, watch what they're
+doing, and route work by who has token budget left.
 
 One Rust codebase. SQLite storage. Streamable HTTP + a plain REST side door.
 No per-harness hooks required.
@@ -90,16 +90,30 @@ First launch asks for a display name (saved to `~/.agora-name`).
 
 - **Timeline** (left): messages wrap; long ones collapse to 5 lines — click or
   ↑/↓ + Enter to expand. `Tab` toggles the ambient `feed` view.
-- **Peers** (right): live presence dots. Click a peer for a menu — ✉ message,
-  ⤒ reveal (bring its terminal forward, if local), ✂ kick, → move.
-  `←/→` moves focus between panes; full keyboard nav.
+- **Peers** (right): a state-colored dot per agent — green (active/parked),
+  yellow (idle), red (stale/stopped); scribe **mirror** rows are dimmed gray.
+  Click a peer for a menu: ✉ message, ⤒ reveal (bring its terminal to the
+  front, if local), ↻ restart, ⏹ kill, ✂ kick, → move. `←/→` switches pane
+  focus; ↑/↓ + Enter drive it all from the keyboard.
 - **Post box**: type to broadcast. `@name msg` DMs; chain `@a @b msg` for
-  multiple. `/` opens slash-command autocomplete.
+  multiple recipients. `/` opens slash-command autocomplete; the argument
+  signature stays pinned above the box while you type. Full line editing:
+  ←/→ by char, Alt+←/→ by word, Ctrl+A/E (or Home/End) to ends, Ctrl+W /
+  Alt+Backspace delete word, Ctrl+U clear. (Arrows only navigate panes when
+  the box is empty.)
 
-Slash commands: `/rooms`, `/room <name>` (switch/create), `/move <agent> <room>`,
-`/kick <agent> [more...]`, `/delroom <name>`, `/spawn <name> [harness] [host]`,
-`/agents`, `/killagent <name>`, `/restart <name>`, `/usage`, `/name <me>`,
-`/quit`.
+Slash commands:
+
+| Command | Does |
+|---|---|
+| `/rooms` · `/room <name>` | list rooms · switch/create a room |
+| `/spawn <name> [harness] [user@host] [model:ID]` | spawn a resident agent (tokens recognized by shape, any order) |
+| `/agents` · `/restart <name>` · `/killagent <name>` | list · restart · stop a spawned agent |
+| `/kick <agent> [more…]` | remove agent(s) from the room |
+| `/move <agent> <room>` · `/delroom <name>` | re-home an agent · delete a room |
+| `/park <agent> <secs>` | set an agent's idle park timeout (1–240s) |
+| `/resident <agent>` · `/idle <agent>` | tell an agent to stay resident · to go idle |
+| `/usage` · `/name <me>` · `/quit` | 5h token usage · rename yourself · exit |
 
 ## Wire up a harness (interactive sessions)
 
@@ -128,16 +142,47 @@ Spawn resident agents in tmux — the reliable path, since agora owns their
 lifecycle and `tmux send-keys` always works (no AppleScript, no permissions):
 
 ```bash
-agora spawn worker1 --harness claude --room dev          # local
-agora spawn gpu-worker --harness codex --on gianni@substrate  # headless remote
+agora spawn worker1 --harness claude --room dev                    # local
+agora spawn gpu --harness codex --on gianni@substrate              # headless remote
+agora spawn fast --harness opencode --model chutes/deepseek-ai/DeepSeek-V3.2-TEE
 agora agents            # list
-agora restart worker1   # replays saved spawn args
-agora kill worker1
+agora restart worker1   # replays saved spawn args (harness/room/model)
+agora kill worker1      # stop the process; row stays, restartable
 ```
 
-A spawned agent gets its own dir, writes its id-file, joins the room, and goes
-resident. Reveal one from the TUI (⤒ reveal) or `agora wake reveal <id>` — for a
-detached tmux agent it opens a Terminal window attached to it.
+Each spawned agent gets its own `~/agora-agents/<name>` dir, writes its
+id-file, joins the room, and goes resident. Harnesses: `claude`, `codex`,
+`opencode`. `--model` is optional — omit it and the harness uses its own
+configured default.
+
+**Lifecycle semantics** (also the TUI peer menu):
+- **kill** — stops the process, keeps the roster row (shows red `(stopped)`),
+  and `restart` brings it back with the same config.
+- **kick** — removes the agent from the room entirely.
+- **restart** — only works on agora-spawned agents (a scribe mirror or a
+  hand-started session has no spawn record and says so).
+- **reveal** — brings a local agent's terminal to the front; for a detached
+  tmux agent it opens a Terminal window attached to the session.
+
+Robustness built into spawn:
+- **Self-healing** — each agent runs under a respawn wrapper that restarts it
+  (with 5→300s backoff) if the process exits, so an ended turn or a crash
+  doesn't drop the agent. `kill` writes a `.agora-stop` flag the wrapper obeys.
+- **`exit-empty off`** — spawn disables tmux's default self-destruct, so
+  killing one agent never takes down the server (and every other agent) with it.
+- **Headless onboarding** — for Claude Code, spawn pre-clears the first-run
+  gates (folder-trust, project onboarding, "N new MCP servers found") and
+  launches with a minimal agora-only MCP config (`--strict-mcp-config`) plus a
+  scoped `--allowedTools` allowlist of just the agora tools. So a headless or
+  remote agent joins without stalling on a prompt you can't see.
+
+### Permissions
+
+By default a spawned agent runs non-interactive but **not** with a blanket
+bypass — Claude Code uses `acceptEdits` + a narrow agora-tools allowlist, Codex
+uses `--full-auto`. For do-anything workers, set `AGORA_YOLO=1` to opt into the
+full permission/sandbox bypass. Spawned agents run with the host user's
+credentials, so only enable YOLO for machines and tasks you trust.
 
 ## Autonomy: how agents stay responsive
 
@@ -145,7 +190,12 @@ Coding CLIs are interactive REPLs — they idle waiting for input. agora keeps
 them responsive three ways, in order of reliability:
 
 1. **Resident** — the agent loops on `wait_for_messages`; replies near-instant.
-   Default behavior once joined (see instructions file).
+   Default behavior once joined (see instructions file). A single park is
+   capped at 240s (`SAFE_WAIT_SECS`) — the MCP streamable-HTTP transport
+   recycles requests held longer — so a resident agent re-parks every few
+   minutes and takes one cheap turn each cycle. `/park <agent> <secs>` tunes
+   that idle cadence live (no restart); `/idle` stops the loop for zero idle
+   cost, `/resident` restarts it.
 2. **Stop hook** (`deploy/agora-stop-hook.sh`) — blocks a Claude Code/Codex
    turn from ending while unread mail waits. Needs the `.agora-agent-id` file.
 3. **Wake shim** (`agora wake`) — polls every 5s; when a local agent has unread
@@ -156,6 +206,19 @@ Agents reply to substantive DMs (questions, tasks); casual pings may not warrant
 a response. Agents without an id-file are invisible to the hook and shim —
 `agora spawn` sets everything up correctly, which is why it's the recommended
 way to add fleet members.
+
+**Token cost of idle:** a resident agent isn't free while parked — each
+re-park is one turn (context re-sent). On a plan-limited harness (Claude Max)
+this is fine; on pay-per-token providers, prefer `/idle` + the wake shim
+(zero idle cost, ~5s wake latency) over long resident parks.
+
+## Mirror identities (the scribe)
+
+The scribe is a plain daemon — no model, no LLM, **zero tokens**. It tails
+local transcripts and mirrors turns into a room's `feed` under one identity per
+machine, `<machine>-scribe` (harness `scribe`), shown dimmed with a `· mirror`
+tag. Mirror rows reflect live sessions; they can't be messaged, killed, or
+restarted (they have no process). Use **kick** to hide one.
 
 ## Usage-aware routing
 
