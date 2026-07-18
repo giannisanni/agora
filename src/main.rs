@@ -240,6 +240,38 @@ impl Db {
         Ok(n)
     }
 
+    fn rooms(&self) -> rusqlite::Result<Vec<serde_json::Value>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT a.room, COUNT(*), COALESCE((SELECT COUNT(*) FROM messages m WHERE m.room = a.room), 0)
+             FROM agents a GROUP BY a.room ORDER BY a.room",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(json!({
+                    "room": r.get::<_, String>(0)?,
+                    "agents": r.get::<_, i64>(1)?,
+                    "messages": r.get::<_, i64>(2)?,
+                }))
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// Re-home an agent: future posts and inbox reads follow the agent row's
+    /// room, so this transparently moves a live agent. Cursor jumps to the new
+    /// room's head — the agent starts fresh there, no history flood.
+    fn move_agent(&self, name: &str, from: &str, to: &str) -> Result<(), AgoraErr> {
+        let conn = self.0.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE agents SET room = ?1,
+                    cursor = COALESCE((SELECT MAX(id) FROM messages WHERE room = ?1), 0)
+             WHERE room = ?2 AND name = ?3",
+            (to, from, name),
+        )?;
+        if n == 0 { Err(AgoraErr::Denied) } else { Ok(()) }
+    }
+
     // observer view for the TUI: recent inbox-class traffic, no cursor effects
     fn recent_messages(&self, room: &str, limit: i64) -> rusqlite::Result<Vec<serde_json::Value>> {
         let conn = self.0.lock().unwrap();
@@ -586,6 +618,37 @@ async fn unread(
     Ok(axum::Json(json!({ "unread": n })))
 }
 
+async fn http_rooms(
+    axum::extract::State(db): axum::extract::State<Arc<Db>>,
+    headers: axum::http::HeaderMap,
+) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    check_token(&headers)?;
+    let rooms = db
+        .rooms()
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(axum::Json(json!({ "rooms": rooms })))
+}
+
+#[derive(serde::Deserialize)]
+struct MoveReq {
+    name: String,
+    from: String,
+    to: String,
+}
+
+async fn http_move(
+    axum::extract::State(db): axum::extract::State<Arc<Db>>,
+    headers: axum::http::HeaderMap,
+    axum::Json(req): axum::Json<MoveReq>,
+) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    check_token(&headers)?;
+    db.move_agent(&req.name, &req.from, &req.to).map_err(|e| match e {
+        AgoraErr::Denied => (axum::http::StatusCode::NOT_FOUND, "no such agent in that room".into()),
+        AgoraErr::Db(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    })?;
+    Ok(axum::Json(json!({ "ok": true })))
+}
+
 // plain HTTP door for the scribe daemon, gated by a shared secret
 async fn ingest(
     axum::extract::State(db): axum::extract::State<Arc<Db>>,
@@ -634,6 +697,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/feed", axum::routing::get(http_feed))
         .route("/peers", axum::routing::get(http_peers))
         .route("/messages", axum::routing::get(http_messages))
+        .route("/rooms", axum::routing::get(http_rooms))
+        .route("/move", axum::routing::post(http_move))
         .with_state(db_state)
         .nest_service("/mcp", service);
     let listener = tokio::net::TcpListener::bind(&addr).await?;

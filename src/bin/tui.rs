@@ -56,6 +56,11 @@ impl App {
         if text.is_empty() {
             return;
         }
+        if let Some(cmd) = text.strip_prefix('/') {
+            self.command(cmd.to_string());
+            self.input.clear();
+            return;
+        }
         // "@name message" = targeted
         let (to, body) = match text.strip_prefix('@') {
             Some(rest) => match rest.split_once(' ') {
@@ -82,6 +87,49 @@ impl App {
     }
 }
 
+impl App {
+    fn command(&mut self, cmd: String) {
+        let mut parts = cmd.split_whitespace();
+        match (parts.next().unwrap_or(""), parts.next(), parts.next()) {
+            ("rooms", _, _) => {
+                match get(&format!("{}/rooms", self.hub), &self.token) {
+                    Some(v) => {
+                        let list: Vec<String> = v["rooms"].as_array().cloned().unwrap_or_default()
+                            .iter()
+                            .map(|r| format!("{}({}a/{}m)",
+                                r["room"].as_str().unwrap_or("?"),
+                                r["agents"].as_i64().unwrap_or(0),
+                                r["messages"].as_i64().unwrap_or(0)))
+                            .collect();
+                        self.status = format!("rooms: {}", list.join("  "));
+                    }
+                    None => self.status = "rooms: fetch failed".into(),
+                }
+            }
+            ("room", Some(r), _) => {
+                self.room = r.to_string();
+                self.refresh();
+                self.status = format!("switched to room {} ({} msgs)", self.room, self.messages.len());
+            }
+            ("move", Some(agent), Some(to)) => {
+                let payload = serde_json::json!({ "name": agent, "from": self.room, "to": to });
+                match ureq::post(&format!("{}/move", self.hub))
+                    .header("x-agora-token", &self.token)
+                    .send_json(&payload)
+                {
+                    Ok(_) => { self.status = format!("moved {agent} -> {to}"); self.refresh(); }
+                    Err(e) => self.status = format!("move failed: {e}"),
+                }
+            }
+            ("name", Some(n), _) => {
+                self.name = n.to_string();
+                self.status = format!("posting as {}", self.name);
+            }
+            _ => self.status = "commands: /rooms  /room <name>  /move <agent> <room>  /name <me>".into(),
+        }
+    }
+}
+
 fn ts(unix: i64) -> String {
     // hh:mm local from unix secs; no chrono, coarse TZ via env-free libc localtime
     // ponytail: UTC display; local-TZ needs chrono
@@ -89,7 +137,33 @@ fn ts(unix: i64) -> String {
     format!("{:02}:{:02}", secs / 3600 % 24, secs / 60 % 60)
 }
 
-fn msg_lines<'a>(msgs: &'a [serde_json::Value], accent: Color) -> Vec<ListItem<'a>> {
+fn wrap_text(s: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in s.lines() {
+        let mut line = String::new();
+        for word in raw.split_whitespace() {
+            if line.is_empty() {
+                line = word.to_string();
+            } else if line.chars().count() + 1 + word.chars().count() <= width {
+                line.push(' ');
+                line.push_str(word);
+            } else {
+                out.push(std::mem::take(&mut line));
+                line = word.to_string();
+            }
+            // hard-break words longer than the width
+            while line.chars().count() > width {
+                let head: String = line.chars().take(width).collect();
+                line = line.chars().skip(width).collect();
+                out.push(head);
+            }
+        }
+        out.push(line);
+    }
+    out
+}
+
+fn msg_lines<'a>(msgs: &'a [serde_json::Value], accent: Color, width: usize) -> Vec<ListItem<'a>> {
     msgs.iter()
         .map(|m| {
             let from = m["from"].as_str().unwrap_or("?");
@@ -108,7 +182,7 @@ fn msg_lines<'a>(msgs: &'a [serde_json::Value], accent: Color) -> Vec<ListItem<'
                 header.push(Span::styled(format!(" [{kind}]"), Style::default().fg(Color::Yellow)));
             }
             let mut lines = vec![Line::from(header)];
-            for l in body.lines().take(6) {
+            for l in wrap_text(body, width.saturating_sub(2)) {
                 lines.push(Line::from(Span::raw(format!("  {l}"))));
             }
             ListItem::new(lines)
@@ -119,7 +193,10 @@ fn msg_lines<'a>(msgs: &'a [serde_json::Value], accent: Color) -> Vec<ListItem<'
 fn main() -> io::Result<()> {
     let hub = std::env::var("AGORA_HUB").unwrap_or_else(|_| "http://100.84.87.107:8787".into());
     let room = std::env::var("AGORA_ROOM").unwrap_or_else(|_| "dev".into());
-    let name = std::env::var("AGORA_NAME").unwrap_or_else(|_| "gianni-tui".into());
+    let name = std::env::var("AGORA_NAME").unwrap_or_else(|_| {
+        let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
+        format!("{user}-tui")
+    });
     let token = std::env::var("AGORA_INGEST_TOKEN").ok().or_else(|| {
         let home = std::env::var("HOME").ok()?;
         std::fs::read_to_string(format!("{home}/.agora-ingest-token")).ok()
@@ -156,7 +233,7 @@ fn main() -> io::Result<()> {
             } else {
                 (" messages ", &app.messages, gold)
             };
-            let items = msg_lines(main_items, main_accent);
+            let items = msg_lines(main_items, main_accent, cols[0].width.saturating_sub(2) as usize);
             let count = items.len();
             let list = List::new(items).block(
                 Block::default().borders(Borders::ALL).title(main_title)
@@ -176,10 +253,10 @@ fn main() -> io::Result<()> {
                 let mut lines = vec![Line::from(vec![
                     dot,
                     Span::styled(name.to_string(), Style::default().add_modifier(Modifier::BOLD)),
-                    Span::styled(format!(" {harness}"), Style::default().fg(Color::DarkGray)),
                 ])];
-                if !status.is_empty() {
-                    lines.push(Line::from(Span::styled(format!("   {status}"), Style::default().fg(Color::Gray))));
+                let sub = if status.is_empty() { harness.to_string() } else { format!("{harness} · {status}") };
+                if !sub.is_empty() {
+                    lines.push(Line::from(Span::styled(format!("  {sub}"), Style::default().fg(Color::DarkGray))));
                 }
                 ListItem::new(lines)
             }).collect();
@@ -194,7 +271,7 @@ fn main() -> io::Result<()> {
             f.render_widget(
                 Paragraph::new(app.input.as_str()).wrap(Wrap { trim: false }).block(
                     Block::default().borders(Borders::ALL)
-                        .title(format!(" post as {} (@name for DM) ", app.name))
+                        .title(format!(" [{}] post as {} (@name=DM /help=cmds) ", app.room, app.name))
                         .border_style(Style::default().fg(gold)),
                 ),
                 outer[1],
@@ -203,6 +280,11 @@ fn main() -> io::Result<()> {
                 Paragraph::new(Span::styled(app.status.as_str(), Style::default().fg(Color::DarkGray))),
                 outer[2],
             );
+            // real terminal cursor in the input box (blinks natively)
+            f.set_cursor_position((
+                outer[1].x + 1 + app.input.chars().count() as u16,
+                outer[1].y + 1,
+            ));
         })?;
 
         if event::poll(Duration::from_millis(200))? {
