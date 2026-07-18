@@ -824,15 +824,10 @@ impl App {
                 self.orch(&["restart".to_string(), name.clone()]);
             }
             MenuAction::Kill => {
-                // stop the process but keep the roster entry (restartable);
-                // mark it stale so it shows red immediately instead of lingering
-                // green on its last ping.
+                // orch kill is atomic: stops the process AND marks the agent
+                // stale on the hub (no TUI-side /stale race that let a still-
+                // parked agent re-ping green before the kill landed).
                 self.orch(&["kill".to_string(), name.clone()]);
-                let payload = serde_json::json!({ "room": self.room, "name": name });
-                let _ = ureq::post(&format!("{}/stale", self.hub))
-                    .header("x-agora-token", &self.token)
-                    .send_json(&payload);
-                self.refresh();
             }
             MenuAction::Reveal => {
                 let id = self.peers.get(idx).and_then(|p| p["id"].as_i64()).unwrap_or(-1);

@@ -175,11 +175,24 @@ fn main() {
             std::process::exit(if ok { 0 } else { 1 });
         }
         "kill" => {
-            // set the stop flag first so the respawn loop won't relaunch, then
-            // kill the session; drop the id-file so a reused id can't mis-map.
-            let (ok, out) = run(host, &format!(
-                "touch ~/agora-agents/{name}/.agora-stop 2>/dev/null; tmux kill-session -t agora-{name}; rm -f ~/agora-agents/{name}/.agora-agent-id; echo killed agora-{name}"
-            ));
+            // Atomic stop: stop-flag (no relaunch) → kill session → drop id-file
+            // → mark the agent stale on the hub, all in one sequential script so
+            // a still-parked agent can't re-ping green in a race. Room comes from
+            // the spawn record; token/hub from the local env + token file.
+            let hub = std::env::var("AGORA_HUB").unwrap_or_else(|_| "http://100.84.87.107:8787".into());
+            let script = format!(
+                "cd ~/agora-agents/{name} 2>/dev/null || exit 0; \
+                 touch .agora-stop; \
+                 tmux kill-session -t agora-{name} 2>/dev/null; \
+                 rm -f .agora-agent-id; \
+                 R=$(awk '{{print $2}}' .agora-spawn 2>/dev/null); \
+                 TOK=$(cat ~/.agora-ingest-token 2>/dev/null); \
+                 [ -n \"$R\" ] && [ -n \"$TOK\" ] && \
+                   curl -s -m 5 -X POST -H \"x-agora-token: $TOK\" -H 'Content-Type: application/json' \
+                   {hub}/stale -d \"{{\\\"room\\\":\\\"$R\\\",\\\"name\\\":\\\"{name}\\\"}}\" >/dev/null 2>&1; \
+                 echo killed agora-{name}"
+            );
+            let (ok, out) = run(host, &script);
             print!("{out}");
             std::process::exit(if ok { 0 } else { 1 });
         }
