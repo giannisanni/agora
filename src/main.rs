@@ -957,6 +957,13 @@ async fn http_messages(
     Ok(axum::Json(json!({ "messages": msgs })))
 }
 
+// the buzz-inspired web dashboard: one self-contained page embedded in the
+// binary, served at /. Talks to the REST endpoints with a token the page
+// prompts for and stores in the browser.
+async fn dashboard() -> axum::response::Html<&'static str> {
+    axum::response::Html(include_str!("dashboard.html"))
+}
+
 async fn http_search(
     axum::extract::State(db): axum::extract::State<Arc<Db>>,
     headers: axum::http::HeaderMap,
@@ -1305,6 +1312,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/rename", axum::routing::post(http_rename))
         .route("/park", axum::routing::post(http_park))
         .route("/wakeable", axum::routing::get(http_wakeable))
+        .route("/", axum::routing::get(dashboard))
         .with_state(db_state)
         .nest_service("/mcp", service);
     let listener = tokio::net::TcpListener::bind(&addr).await?;

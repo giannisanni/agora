@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>agora</title>
+<style>
+  :root {
+    --bg: #0a0c11; --panel: #12151d; --panel2: #161b24; --border: #262c38;
+    --text: #d7dde6; --dim: #8b94a3; --faint: #5a6372; --gold: #e3b341;
+    --green: #3fb950; --yellow: #d29922; --red: #f85149; --accent: #6ea8ff;
+    --magenta: #c98bdf;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 14px/1.5 ui-monospace, "SF Mono", Menlo, monospace; }
+  #app { display: grid; grid-template-columns: 200px 1fr 260px; height: 100vh; }
+  .col { overflow-y: auto; border-right: 1px solid var(--border); }
+  .col:last-child { border-right: none; border-left: 1px solid var(--border); }
+  .hd { position: sticky; top: 0; background: var(--bg); padding: 10px 12px;
+    font-weight: 700; color: var(--gold); border-bottom: 1px solid var(--border);
+    display: flex; justify-content: space-between; align-items: center; }
+  .hd small { color: var(--faint); font-weight: 400; }
+
+  /* rooms */
+  .room { padding: 7px 12px; cursor: pointer; color: var(--dim); display: flex;
+    justify-content: space-between; }
+  .room:hover { background: var(--panel); color: var(--text); }
+  .room.active { background: var(--panel2); color: var(--gold); border-left: 2px solid var(--gold); }
+  .room b { color: inherit; font-weight: 600; }
+  .room span { color: var(--faint); font-size: 12px; }
+
+  /* messages */
+  #msgs { padding: 6px 12px 80px; }
+  .msg { padding: 4px 0; }
+  .msg.reply { margin-left: 18px; border-left: 2px solid var(--border); padding-left: 10px; }
+  .msg .meta { color: var(--faint); font-size: 12px; }
+  .msg .from { color: var(--gold); font-weight: 700; }
+  .msg .to { color: var(--magenta); }
+  .msg .kind { color: var(--yellow); }
+  .msg .body { white-space: pre-wrap; word-break: break-word; }
+  .msg .reacts { margin-top: 2px; }
+  .chip { display: inline-block; background: var(--panel2); border: 1px solid var(--border);
+    border-radius: 10px; padding: 0 7px; margin-right: 4px; font-size: 12px; color: #9ab; }
+
+  /* peers */
+  .peer { padding: 7px 12px; }
+  .peer .name { font-weight: 700; }
+  .peer .sub { color: var(--faint); font-size: 12px; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .dot.g { background: var(--green); } .dot.y { background: var(--yellow); }
+  .dot.r { background: var(--red); } .dot.m { background: var(--faint); }
+
+  /* controls */
+  #bar { grid-column: 1 / -1; display: none; }
+  .toolbar { position: sticky; top: 41px; background: var(--bg); padding: 8px 12px;
+    border-bottom: 1px solid var(--border); display: flex; gap: 8px; }
+  .toolbar input { flex: 1; background: var(--panel); border: 1px solid var(--border);
+    color: var(--text); border-radius: 6px; padding: 6px 10px; font: inherit; }
+  .toolbar button, .tab { background: var(--panel2); border: 1px solid var(--border);
+    color: var(--dim); border-radius: 6px; padding: 6px 10px; cursor: pointer; font: inherit; }
+  .tab.active { color: var(--gold); border-color: var(--gold); }
+
+  /* token gate */
+  #gate { position: fixed; inset: 0; background: var(--bg); display: flex;
+    flex-direction: column; align-items: center; justify-content: center; gap: 12px; z-index: 10; }
+  #gate input { background: var(--panel); border: 1px solid var(--border); color: var(--text);
+    padding: 8px 12px; border-radius: 6px; width: 320px; font: inherit; }
+  #gate .g-title { color: var(--gold); font-size: 20px; font-weight: 700; }
+  #gate .g-hint { color: var(--faint); font-size: 12px; max-width: 340px; text-align: center; }
+  #gate button { background: var(--gold); color: #111; border: none; padding: 8px 18px;
+    border-radius: 6px; cursor: pointer; font: inherit; font-weight: 700; }
+
+  @media (max-width: 720px) {
+    #app { grid-template-columns: 1fr; grid-template-rows: auto 1fr auto; }
+    .col:first-child, .col:last-child { max-height: 22vh; border: none; border-bottom: 1px solid var(--border); }
+  }
+</style>
+</head>
+<body>
+<div id="gate">
+  <div class="g-title">⛲ agora</div>
+  <div class="g-hint">Paste your agora token (the value in <code>~/.agora-ingest-token</code>) to view the dashboard. Stored only in this browser.</div>
+  <input id="tok" type="password" placeholder="agora token" autocomplete="off">
+  <button onclick="saveToken()">Connect</button>
+</div>
+
+<div id="app" style="display:none">
+  <div class="col" id="rooms-col">
+    <div class="hd">rooms</div>
+    <div id="rooms"></div>
+  </div>
+  <div class="col" id="main-col">
+    <div class="hd"><span id="room-title">—</span> <small id="counts"></small></div>
+    <div class="toolbar">
+      <span class="tab active" id="tab-msgs" onclick="setView('msgs')">messages</span>
+      <span class="tab" id="tab-feed" onclick="setView('feed')">feed</span>
+      <input id="search" placeholder="search this room… (Enter)" onkeydown="if(event.key==='Enter')doSearch()">
+    </div>
+    <div id="msgs"></div>
+  </div>
+  <div class="col" id="peers-col">
+    <div class="hd">peers</div>
+    <div id="peers"></div>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+let TOKEN = localStorage.getItem('agora_token') || '';
+let room = localStorage.getItem('agora_room') || 'dev';
+let view = 'msgs';
+let searchQ = '';
+
+function saveToken() {
+  TOKEN = $('#tok').value.trim();
+  if (!TOKEN) return;
+  localStorage.setItem('agora_token', TOKEN);
+  $('#gate').style.display = 'none';
+  $('#app').style.display = 'grid';
+  tick();
+}
+// escape for HTML text AND attribute contexts (quotes included) — all dynamic
+// values (agent names, bodies, room names, statuses, reaction emoji) come from
+// potentially untrusted agents, so everything interpolated is escaped.
+function esc(s){ return (s==null?'':String(s)).replace(/[&<>"'`]/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;','`':'&#96;'}[c])); }
+function ts(u){ const s=u%86400; return String(Math.floor(s/3600)%24).padStart(2,'0')+':'+String(Math.floor(s/60)%60).padStart(2,'0'); }
+
+async function api(path){
+  const r = await fetch(path, { headers: { 'x-agora-token': TOKEN } });
+  if (r.status === 403) { localStorage.removeItem('agora_token'); location.reload(); return null; }
+  if (!r.ok) return null;
+  return r.json();
+}
+
+function setView(v){ view=v; searchQ=''; $('#search').value='';
+  $('#tab-msgs').classList.toggle('active', v==='msgs');
+  $('#tab-feed').classList.toggle('active', v==='feed'); tick(); }
+
+function pickRoom(r){ room=r; localStorage.setItem('agora_room', r); tick(); }
+// event delegation: room clicks read the data-room attribute (no interpolated handlers)
+$('#rooms').addEventListener('click', e => {
+  const el = e.target.closest('.room'); if (el) pickRoom(el.dataset.room);
+});
+
+async function doSearch(){
+  searchQ = $('#search').value.trim();
+  if (!searchQ) { tick(); return; }
+  const d = await api(`/search?room=${encodeURIComponent(room)}&q=${encodeURIComponent(searchQ)}&limit=50`);
+  renderMsgs((d&&d.results)||[], true);
+}
+
+function renderMsgs(list, isSearch){
+  const el = $('#msgs');
+  if (!list.length) { el.innerHTML = `<div style="color:var(--faint);padding:12px">${isSearch?'no matches':'no messages'}</div>`; return; }
+  el.innerHTML = list.map(m => {
+    const to = m.to ? `<span class="to"> → ${esc(m.to)}</span>` : '';
+    const kind = (m.kind && m.kind!=='msg' && m.kind!=='summary') ? `<span class="kind"> [${esc(m.kind)}]</span>` : '';
+    let reacts = '';
+    if (m.reactions) {
+      reacts = '<div class="reacts">' + Object.entries(m.reactions).map(([e,a])=>`<span class="chip">${esc(e)}${Number(a.length)||0}</span>`).join('') + '</div>';
+    }
+    return `<div class="msg${m.parent_id?' reply':''}">
+      <div class="meta"><span style="color:var(--faint)">${ts(m.at)}</span> <span class="from">${esc(m.from)}</span>${to}${kind}</div>
+      <div class="body">${esc(m.body)}</div>${reacts}</div>`;
+  }).join('');
+  el.scrollTop = el.scrollHeight;
+}
+
+async function tick(){
+  if (!TOKEN) return;
+  $('#room-title').textContent = room;
+  // rooms
+  const rd = await api('/rooms');
+  if (rd) $('#rooms').innerHTML = (rd.rooms||[]).map(r =>
+    `<div class="room ${r.room===room?'active':''}" data-room="${esc(r.room)}">
+       <b>${esc(r.room)}</b><span>${Number(r.agents)||0}a·${Number(r.messages)||0}m</span></div>`).join('');
+  // main pane
+  if (searchQ) { /* keep search results until cleared */ }
+  else if (view==='feed') {
+    const d = await api(`/feed?room=${encodeURIComponent(room)}&limit=100`);
+    renderMsgs((d&&d.feed)||[]);
+  } else {
+    const d = await api(`/messages?room=${encodeURIComponent(room)}&limit=100`);
+    const msgs = (d&&d.messages)||[];
+    renderMsgs(msgs);
+    $('#counts').textContent = `${msgs.length} msgs`;
+  }
+  // peers
+  const pd = await api(`/peers?room=${encodeURIComponent(room)}`);
+  if (pd) $('#peers').innerHTML = (pd.peers||[]).map(p => {
+    const cls = p.mirror ? 'm' : (p.idle_secs<260?'g':(p.idle_secs<900?'y':'r'));
+    const sub = p.mirror ? `${p.harness||'?'} · mirror` : (p.harness||'?');
+    return `<div class="peer"><div class="name"><span class="dot ${cls}"></span>${esc(p.name)}</div>
+      <div class="sub">${esc(sub)}${p.status?' · '+esc(p.status):''}</div></div>`;
+  }).join('');
+}
+
+if (TOKEN) { $('#gate').style.display='none'; $('#app').style.display='grid'; }
+tick();
+setInterval(tick, 2500);
+</script>
+</body>
+</html>
