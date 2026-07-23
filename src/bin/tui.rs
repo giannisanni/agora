@@ -31,6 +31,7 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("killagent", "<name> [host]", "Kill a spawned tmux agent"),
     ("restart", "<name> [host]", "Restart a spawned tmux agent"),
     ("usage", "", "Show 5h token usage per machine/harness"),
+    ("search", "<text>", "Search this room's messages for text"),
     ("invite", "", "Copy a friend-invite (hub URL + join steps) to clipboard"),
     ("park", "<agent> <secs>", "Set an agent's idle park timeout (1-3600s)"),
     ("resident", "<agent>", "Tell an agent to stay resident (loop wait_for_messages)"),
@@ -94,6 +95,18 @@ fn get(url: &str, token: &str) -> Option<serde_json::Value> {
         .body_mut()
         .read_json()
         .ok()
+}
+
+/// Minimal percent-encoding for a query value (letters/digits/-._~ pass; rest escaped).
+fn urlencode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 fn wrap_text(s: &str, width: usize) -> Vec<String> {
@@ -623,6 +636,25 @@ impl App {
                 }
                 None => self.status = "usage: fetch failed".into(),
             },
+            ("search", Some(_), _) => {
+                let q: String = cmd.splitn(2, ' ').nth(1).unwrap_or("").trim().to_string();
+                let url = format!("{}/search?room={}&q={}&limit=10", self.hub, self.room, urlencode(&q));
+                match get(&url, &self.token) {
+                    Some(v) => {
+                        let hits = v["results"].as_array().cloned().unwrap_or_default();
+                        if hits.is_empty() {
+                            self.status = format!("no matches for '{q}'");
+                        } else {
+                            let preview: Vec<String> = hits.iter().take(3).map(|m| {
+                                format!("{}: {}", m["from"].as_str().unwrap_or("?"),
+                                        m["body"].as_str().unwrap_or("").chars().take(30).collect::<String>())
+                            }).collect();
+                            self.status = format!("{} match(es) for '{q}' — {}", hits.len(), preview.join(" | "));
+                        }
+                    }
+                    None => self.status = "search failed".into(),
+                }
+            }
             ("kick", Some(_), _) => {
                 let names: Vec<String> = cmd.split_whitespace().skip(1).map(String::from).collect();
                 let payload = serde_json::json!({ "room": self.room, "names": names });
@@ -718,6 +750,20 @@ impl App {
                         "  … (click / Enter to collapse)",
                         Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
                     )));
+                }
+            }
+            // reaction chips under the message: 👍2 ✅1 …
+            if let Some(reacts) = m.get("reactions").and_then(|r| r.as_object()) {
+                let mut spans = vec![Span::raw("  ")];
+                for (emoji, agents) in reacts {
+                    let n = agents.as_array().map(|a| a.len()).unwrap_or(0);
+                    spans.push(Span::styled(
+                        format!("{emoji}{n} "),
+                        Style::default().fg(Color::Rgb(140, 160, 200)),
+                    ));
+                }
+                if spans.len() > 1 {
+                    lines.push(Line::from(spans));
                 }
             }
             if used + lines.len() > budget {
