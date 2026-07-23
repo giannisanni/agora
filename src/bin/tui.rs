@@ -755,8 +755,10 @@ impl App {
             // mirror identities (scribe reflections of live sessions) are dimmed
             // gray; real agents use idle-state color (green/yellow/red).
             let (dot_color, sel_color) = if mirror { (Color::DarkGray, Color::DarkGray) }
-                else if idle < 90 { (Color::Green, Color::Green) }
-                else if idle < 600 { (Color::Yellow, Color::Yellow) }
+                // a parked resident refreshes presence each wait cycle (≤240s),
+                // so green must cover that window; stale agents pass 260 → red.
+                else if idle < 260 { (Color::Green, Color::Green) }
+                else if idle < 900 { (Color::Yellow, Color::Yellow) }
                 else { (Color::Red, Color::Red) };
             let sel = self.peers_focused && self.peer_sel == idx && self.peer_menu.is_none();
             // name wraps to continuation lines (dot only on the first), no clipping

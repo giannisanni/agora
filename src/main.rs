@@ -1,9 +1,10 @@
 use std::sync::{Arc, Mutex};
 
 use rmcp::{
-    ErrorData as McpError, ServerHandler,
+    ErrorData as McpError, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, tool::Extension, wrapper::Parameters},
     model::*,
+    service::RequestContext,
     tool, tool_handler, tool_router,
     transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
@@ -244,6 +245,37 @@ impl Db {
             })?
             .collect::<Result<_, _>>()?;
         Ok(rows)
+    }
+
+    /// Non-consuming, non-touching peek for the wait loop: verifies ownership
+    /// (kicked/foreign agent -> Denied) and returns unread inbox-class count
+    /// WITHOUT advancing the cursor or updating last_seen. This is what lets a
+    /// zombie wait loop (client dead) go stale and stay wakeable instead of
+    /// perpetually consuming its own inbox and looking green.
+    fn peek(&self, agent_id: i64, user: &str) -> Result<i64, AgoraErr> {
+        let conn = self.0.lock().unwrap();
+        Self::verify(&conn, agent_id, user)?;
+        let (room, name, cursor): (String, String, i64) = conn.query_row(
+            "SELECT room, name, cursor FROM agents WHERE id = ?1",
+            [agent_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        let n = conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM messages
+                 WHERE room = ?1 AND id > ?2 AND sender != ?3 AND kind NOT IN ({FEED_KINDS})
+                   AND (recipient IS NULL OR recipient = ?3)"
+            ),
+            (&room, cursor, &name),
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
+    /// Refresh presence for a parked agent (called at wait entry / timeout).
+    fn touch_now(&self, agent_id: i64) {
+        let conn = self.0.lock().unwrap();
+        Self::touch(&conn, agent_id);
     }
 
     // peek without consuming: how many inbox-class messages await this agent
@@ -610,19 +642,31 @@ impl Agora {
         &self,
         Parameters(p): Parameters<WaitParams>,
         Extension(parts): Extension<Parts>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let user = caller(&parts);
         // explicit arg wins; otherwise the agent's stored park_secs. Cap 1h.
         let configured = self.db.park_secs(p.agent_id).unwrap_or(600).max(0) as u64;
         let timeout = p.timeout_secs.unwrap_or(configured).clamp(1, SAFE_WAIT_SECS);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+        self.db.touch_now(p.agent_id); // presence at entry
         loop {
-            match self.db.inbox(p.agent_id, &user) {
-                Ok(msgs) if !msgs.is_empty() => return Ok(ok_json(json!({ "messages": msgs }))),
-                Ok(_) => {} // empty inbox, keep parking
-                // MONEY GUARD: the agent row is gone (kicked) or not ours. Do NOT
-                // return an error — a resident loop would retry instantly and burn
-                // tokens forever. Return a terminal STOP so the agent ends its turn.
+            // client disconnected / cancelled the request → stop the loop so a
+            // dead agent's wait doesn't run on as a zombie (keeping it falsely
+            // green and eating its own inbox).
+            if ctx.ct.is_cancelled() {
+                return Ok(ok_json(json!({ "messages": [], "cancelled": true })));
+            }
+            // PEEK, don't consume: no touch, no cursor advance while empty.
+            match self.db.peek(p.agent_id, &user) {
+                Ok(0) => {} // nothing yet
+                Ok(_) => {
+                    // deliver: this call consumes + touches
+                    let msgs = self.db.inbox(p.agent_id, &user).map_err(agora_err)?;
+                    return Ok(ok_json(json!({ "messages": msgs })));
+                }
+                // MONEY GUARD: agent row gone (kicked) or not ours — return a
+                // terminal STOP, not an error a resident loop would retry-burn on.
                 Err(AgoraErr::Denied) => {
                     return Ok(ok_json(json!({
                         "evicted": true,
@@ -633,9 +677,13 @@ impl Agora {
                 Err(e) => return Err(agora_err(e)),
             }
             if std::time::Instant::now() >= deadline {
+                self.db.touch_now(p.agent_id); // refresh presence on clean timeout
                 return Ok(ok_json(json!({ "messages": [] })));
             }
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            tokio::select! {
+                _ = ctx.ct.cancelled() => return Ok(ok_json(json!({ "messages": [], "cancelled": true }))),
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+            }
         }
     }
 

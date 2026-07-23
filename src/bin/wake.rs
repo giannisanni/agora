@@ -1,10 +1,12 @@
 //! agora wake shim: wakes idle local agents that have unread mail by typing a
-//! nudge into their terminal. Terminal adapters: tmux, Mosaic, iTerm2.
+//! nudge into their terminal. Built-in adapters: tmux, Mosaic, iTerm2, Apple
+//! Terminal. For anything else (WezTerm, Kitty, Alacritty, Cline, ssh-tmux …)
+//! drop an executable in ~/.config/agora/injectors/ — see run_injectors().
 //!
 //! Mapping: agents drop `.agora-agent-id` in their cwd; the shim scans
-//! AGORA_WAKE_DIRS (colon-separated, default ~/workspace) for those files,
-//! intersects with the hub's /wakeable list (idle + unread), finds a local
-//! terminal whose foreground process cwd matches, and types the nudge.
+//! AGORA_WAKE_DIRS (colon-separated, default $HOME), intersects with the hub's
+//! /wakeable list (idle + unread), finds a local terminal whose foreground
+//! process cwd matches, and types the nudge.
 //! ponytail: nudges any terminal at that cwd without proving an agent runs
 //! there; per-process verification if misfires ever happen.
 
@@ -238,6 +240,53 @@ end tell"#
     }
 }
 
+/// Pluggable injectors (AMQ-style): any executable in the injectors dir
+/// (AGORA_INJECTORS_DIR, default ~/.config/agora/injectors) is a fallback for
+/// terminals the built-in adapters don't cover. Contract: called as
+/// `injector <cwd> <agent_name>` with the nudge text on stdin; exit 0 means
+/// "I found a terminal at that cwd and delivered the message". First success
+/// wins. This lets people add WezTerm/Kitty/Cline/ssh-tmux/etc. without
+/// recompiling the shim.
+fn injectors_dir() -> std::path::PathBuf {
+    std::env::var("AGORA_INJECTORS_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_default();
+            std::path::PathBuf::from(home).join(".config/agora/injectors")
+        })
+}
+
+fn run_injectors(cwd: &str, name: &str, text: &str) -> bool {
+    let dir = injectors_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else { return false };
+    let mut scripts: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && std::fs::metadata(p).map(|m| {
+            use std::os::unix::fs::PermissionsExt;
+            m.permissions().mode() & 0o111 != 0
+        }).unwrap_or(false))
+        .collect();
+    scripts.sort(); // deterministic order
+    for script in scripts {
+        use std::io::Write;
+        let child = Command::new(&script)
+            .arg(cwd)
+            .arg(name)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        if let Ok(mut c) = child {
+            if let Some(si) = c.stdin.as_mut() { let _ = si.write_all(text.as_bytes()); }
+            if c.wait().map(|s| s.success()).unwrap_or(false) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn wake(target: &Target, text: &str) -> bool {
     match target {
         Target::Tmux(id) => {
@@ -351,12 +400,16 @@ fn main() {
                 if last_wake.get(&id).is_some_and(|t| t.elapsed() < Duration::from_secs(COOLDOWN_SECS)) {
                     continue;
                 }
-                if let Some((target, _)) = terms.iter().find(|(_, tcwd)| *tcwd == cwd) {
-                    let preview = latest_for(&hub, &token, room, name);
-                    if wake(target, &nudge_text(unread, preview)) {
-                        println!("woke agent {id} ({name}) at {cwd} ({unread} unread)");
-                        last_wake.insert(id, Instant::now());
-                    }
+                let preview = latest_for(&hub, &token, room, name);
+                let nudge = nudge_text(unread, preview);
+                // built-in adapters first; then pluggable injector scripts.
+                let woke = match terms.iter().find(|(_, tcwd)| *tcwd == cwd) {
+                    Some((target, _)) => wake(target, &nudge),
+                    None => false,
+                } || run_injectors(&cwd, name, &nudge);
+                if woke {
+                    println!("woke agent {id} ({name}) at {cwd} ({unread} unread)");
+                    last_wake.insert(id, Instant::now());
                 }
             }
         }
