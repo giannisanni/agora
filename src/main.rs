@@ -84,6 +84,7 @@ impl Db {
         let _ = conn.execute("ALTER TABLE agents ADD COLUMN user TEXT NOT NULL DEFAULT 'owner'", []);
         let _ = conn.execute("ALTER TABLE agents ADD COLUMN park_secs INTEGER NOT NULL DEFAULT 180", []);
         let _ = conn.execute("ALTER TABLE agents ADD COLUMN mirror INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute("ALTER TABLE messages ADD COLUMN parent_id INTEGER", []);
         conn.execute_batch(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_source
              ON messages(room, source_id) WHERE source_id IS NOT NULL;
@@ -93,6 +94,13 @@ impl Db {
                 tokens_5h INTEGER DEFAULT 0,
                 updated INTEGER DEFAULT 0,
                 PRIMARY KEY(machine, harness)
+             );
+             CREATE TABLE IF NOT EXISTS reactions(
+                message_id INTEGER NOT NULL,
+                agent TEXT NOT NULL,
+                emoji TEXT NOT NULL,
+                created INTEGER DEFAULT (unixepoch()),
+                PRIMARY KEY(message_id, agent, emoji)
              );",
         )?;
         Ok(Self(Mutex::new(conn)))
@@ -142,7 +150,8 @@ impl Db {
         if owner != user { Err(AgoraErr::Denied) } else { Ok(()) }
     }
 
-    fn post(&self, agent_id: i64, user: &str, text: &str, to: Option<&str>, kind: &str, source_id: Option<&str>) -> Result<(i64, bool), AgoraErr> {
+    #[allow(clippy::too_many_arguments)]
+    fn post(&self, agent_id: i64, user: &str, text: &str, to: Option<&str>, kind: &str, source_id: Option<&str>, parent_id: Option<i64>) -> Result<(i64, bool), AgoraErr> {
         let conn = self.0.lock().unwrap();
         Self::verify(&conn, agent_id, user)?;
         let (room, name): (String, String) = conn.query_row(
@@ -174,8 +183,8 @@ impl Db {
             }
         }
         conn.execute(
-            "INSERT INTO messages(room, sender, recipient, body, kind, source_id) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-            (&room, &name, to, text, kind, source_id),
+            "INSERT INTO messages(room, sender, recipient, body, kind, source_id, parent_id) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            (&room, &name, to, text, kind, source_id, parent_id),
         )?;
         let id = conn.last_insert_rowid();
         Self::touch(&conn, agent_id);
@@ -276,6 +285,94 @@ impl Db {
     fn touch_now(&self, agent_id: i64) {
         let conn = self.0.lock().unwrap();
         Self::touch(&conn, agent_id);
+    }
+
+    /// Toggle a reaction (emoji ack) by an agent on a message: adds it, or
+    /// removes it if the same agent already reacted with that emoji.
+    fn react(&self, agent_id: i64, user: &str, message_id: i64, emoji: &str) -> Result<bool, AgoraErr> {
+        let conn = self.0.lock().unwrap();
+        Self::verify(&conn, agent_id, user)?;
+        let name: String = conn.query_row("SELECT name FROM agents WHERE id = ?1", [agent_id], |r| r.get(0))?;
+        let removed = conn.execute(
+            "DELETE FROM reactions WHERE message_id = ?1 AND agent = ?2 AND emoji = ?3",
+            (message_id, &name, emoji),
+        )? > 0;
+        if !removed {
+            conn.execute(
+                "INSERT OR IGNORE INTO reactions(message_id, agent, emoji) VALUES(?1, ?2, ?3)",
+                (message_id, &name, emoji),
+            )?;
+        }
+        Self::touch(&conn, agent_id);
+        Ok(!removed) // true = added, false = removed
+    }
+
+    /// Reactions on a set of messages: {message_id: {emoji: [agents]}}.
+    fn reactions_for(conn: &Connection, ids: &[i64]) -> serde_json::Value {
+        if ids.is_empty() { return json!({}); }
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT message_id, emoji, agent FROM reactions WHERE message_id IN ({placeholders}) ORDER BY created");
+        let mut map = serde_json::Map::new();
+        if let Ok(mut stmt) = conn.prepare(&sql) {
+            let rows = stmt.query_map(rusqlite::params_from_iter(ids), |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            });
+            if let Ok(rows) = rows {
+                for (mid, emoji, agent) in rows.flatten() {
+                    let m = map.entry(mid.to_string()).or_insert_with(|| json!({})).as_object_mut().unwrap();
+                    m.entry(emoji).or_insert_with(|| json!([])).as_array_mut().unwrap().push(json!(agent));
+                }
+            }
+        }
+        serde_json::Value::Object(map)
+    }
+
+    /// Full-text-ish search across a room's message bodies (LIKE). Returns
+    /// matching messages newest-first, optionally filtered by sender.
+    fn search(&self, room: &str, query: &str, from: Option<&str>, limit: i64) -> rusqlite::Result<Vec<serde_json::Value>> {
+        let conn = self.0.lock().unwrap();
+        let like = format!("%{query}%");
+        let mut stmt = conn.prepare(
+            "SELECT id, sender, recipient, body, created, kind FROM messages
+             WHERE room = ?1 AND body LIKE ?2 AND (?3 IS NULL OR sender = ?3)
+             ORDER BY id DESC LIMIT ?4",
+        )?;
+        let rows = stmt
+            .query_map((room, &like, from, limit), |r| {
+                Ok(json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "from": r.get::<_, String>(1)?,
+                    "to": r.get::<_, Option<String>>(2)?,
+                    "body": r.get::<_, String>(3)?,
+                    "at": r.get::<_, i64>(4)?,
+                    "kind": r.get::<_, String>(5)?,
+                }))
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// Messages in a thread (replies whose parent_id = root), plus the root.
+    fn thread(&self, room: &str, root_id: i64) -> rusqlite::Result<Vec<serde_json::Value>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, sender, recipient, body, created, kind, parent_id FROM messages
+             WHERE room = ?1 AND (id = ?2 OR parent_id = ?2) ORDER BY id ASC",
+        )?;
+        let rows = stmt
+            .query_map((room, root_id), |r| {
+                Ok(json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "from": r.get::<_, String>(1)?,
+                    "to": r.get::<_, Option<String>>(2)?,
+                    "body": r.get::<_, String>(3)?,
+                    "at": r.get::<_, i64>(4)?,
+                    "kind": r.get::<_, String>(5)?,
+                    "parent_id": r.get::<_, Option<i64>>(6)?,
+                }))
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
     }
 
     // peek without consuming: how many inbox-class messages await this agent
@@ -438,7 +535,7 @@ impl Db {
     fn recent_messages(&self, room: &str, limit: i64) -> rusqlite::Result<Vec<serde_json::Value>> {
         let conn = self.0.lock().unwrap();
         let mut stmt = conn.prepare(&format!(
-            "SELECT id, sender, recipient, body, created, kind FROM messages
+            "SELECT id, sender, recipient, body, created, kind, parent_id FROM messages
              WHERE room = ?1 AND kind NOT IN ({FEED_KINDS})
              ORDER BY id DESC LIMIT ?2",
         ))?;
@@ -451,10 +548,19 @@ impl Db {
                     "body": r.get::<_, String>(3)?,
                     "at": r.get::<_, i64>(4)?,
                     "kind": r.get::<_, String>(5)?,
+                    "parent_id": r.get::<_, Option<i64>>(6)?,
                 }))
             })?
             .collect::<Result<_, _>>()?;
         rows.reverse();
+        // attach reactions for these messages
+        let ids: Vec<i64> = rows.iter().filter_map(|m| m["id"].as_i64()).collect();
+        let reacts = Self::reactions_for(&conn, &ids);
+        for m in &mut rows {
+            if let Some(r) = m["id"].as_i64().and_then(|id| reacts.get(id.to_string())) {
+                m["reactions"] = r.clone();
+            }
+        }
         Ok(rows)
     }
 
@@ -549,6 +655,39 @@ struct PostParams {
     /// Idempotency key: reposting the same source_id to a room returns the existing message instead of duplicating
     #[serde(default)]
     source_id: Option<String>,
+    /// Optional message_id to reply under — makes this a threaded reply
+    #[serde(default)]
+    parent_id: Option<i64>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct ReactParams {
+    /// Your agent id from join_room
+    agent_id: i64,
+    /// The message_id to react to
+    message_id: i64,
+    /// An emoji, e.g. "👍", "✅", "👀" (reacting again with the same one removes it)
+    emoji: String,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct SearchParams {
+    /// Room to search
+    room: String,
+    /// Text to find in message bodies (substring match)
+    query: String,
+    /// Only messages from this agent name
+    from: Option<String>,
+    /// Max results (default 20)
+    limit: Option<i64>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct ThreadParams {
+    /// Room name
+    room: String,
+    /// The root message_id whose thread (root + replies) to fetch
+    root_id: i64,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -624,7 +763,7 @@ impl Agora {
         let user = caller(&parts);
         let (id, new) = self
             .db
-            .post(p.agent_id, &user, &p.text, p.to.as_deref(), kind, p.source_id.as_deref())
+            .post(p.agent_id, &user, &p.text, p.to.as_deref(), kind, p.source_id.as_deref(), p.parent_id)
             .map_err(agora_err)?;
         // monitor-the-room: every interaction also delivers your unseen mail
         let unseen = self.db.inbox(p.agent_id, &user).map_err(agora_err)?;
@@ -635,6 +774,24 @@ impl Agora {
     fn feed(&self, Parameters(p): Parameters<FeedParams>) -> Result<CallToolResult, McpError> {
         let entries = self.db.feed(&p.room, p.from.as_deref(), p.limit.unwrap_or(20)).map_err(db_err)?;
         Ok(ok_json(json!({ "feed": entries })))
+    }
+
+    #[tool(description = "React to a message with an emoji (a lightweight ack — e.g. 👍 seen, ✅ done, 👀 looking) without sending a full message. Reacting again with the same emoji removes it.")]
+    fn react(&self, Parameters(p): Parameters<ReactParams>, Extension(parts): Extension<Parts>) -> Result<CallToolResult, McpError> {
+        let added = self.db.react(p.agent_id, &caller(&parts), p.message_id, &p.emoji).map_err(agora_err)?;
+        Ok(ok_json(json!({ "message_id": p.message_id, "emoji": p.emoji, "added": added })))
+    }
+
+    #[tool(description = "Search a room's message history by text (substring), optionally filtered to one sender. Returns matching messages newest-first.")]
+    fn search(&self, Parameters(p): Parameters<SearchParams>) -> Result<CallToolResult, McpError> {
+        let hits = self.db.search(&p.room, &p.query, p.from.as_deref(), p.limit.unwrap_or(20)).map_err(db_err)?;
+        Ok(ok_json(json!({ "results": hits })))
+    }
+
+    #[tool(description = "Fetch a thread: the root message plus every reply posted with parent_id = root_id, oldest first. Use with post's parent_id to hold a focused sub-conversation.")]
+    fn thread(&self, Parameters(p): Parameters<ThreadParams>) -> Result<CallToolResult, McpError> {
+        let msgs = self.db.thread(&p.room, p.root_id).map_err(db_err)?;
+        Ok(ok_json(json!({ "thread": msgs })))
     }
 
     #[tool(description = "Block until a message arrives for you (or timeout), then return it like inbox. Terminal-agnostic wake: call this when idle and waiting. Omit timeout_secs to use your server-configured park timeout (settable by the operator), which lets the operator retune your idle cadence without restarting you.")]
@@ -798,6 +955,35 @@ async fn http_messages(
         .recent_messages(&room, limit)
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(axum::Json(json!({ "messages": msgs })))
+}
+
+async fn http_search(
+    axum::extract::State(db): axum::extract::State<Arc<Db>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    check_token(&headers)?;
+    let room = q.get("room").cloned().unwrap_or_else(|| "dev".into());
+    let query = q.get("q").cloned().unwrap_or_default();
+    let limit: i64 = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(30);
+    let hits = db
+        .search(&room, &query, q.get("from").map(|s| s.as_str()), limit)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(axum::Json(json!({ "results": hits })))
+}
+
+async fn http_thread(
+    axum::extract::State(db): axum::extract::State<Arc<Db>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    check_token(&headers)?;
+    let room = q.get("room").cloned().unwrap_or_else(|| "dev".into());
+    let root: i64 = q.get("root").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let msgs = db
+        .thread(&room, root)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(axum::Json(json!({ "thread": msgs })))
 }
 
 // non-consuming unread count, for turn-boundary hooks ("should I check inbox
@@ -1022,7 +1208,7 @@ async fn ingest(
     let (agent_id, _) = db.join(&req.room, &req.name, &req.harness, &req.machine, "owner").map_err(err)?;
     if req.mirror { db.set_mirror(&req.room, &req.name); }
     let (id, new) = db
-        .post(agent_id, "owner", &req.body, req.to.as_deref(), req.kind.as_deref().unwrap_or("summary"), req.source_id.as_deref())
+        .post(agent_id, "owner", &req.body, req.to.as_deref(), req.kind.as_deref().unwrap_or("summary"), req.source_id.as_deref(), None)
         .map_err(err)?;
     Ok(axum::Json(json!({ "message_id": id, "new": new })))
 }
@@ -1107,6 +1293,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/feed", axum::routing::get(http_feed))
         .route("/peers", axum::routing::get(http_peers))
         .route("/messages", axum::routing::get(http_messages))
+        .route("/search", axum::routing::get(http_search))
+        .route("/thread", axum::routing::get(http_thread))
         .route("/rooms", axum::routing::get(http_rooms))
         .route("/move", axum::routing::post(http_move))
         .route("/kick", axum::routing::post(http_kick))
@@ -1141,7 +1329,7 @@ mod tests {
         let (a, _) = db.join("r", "alice", "", "", "owner").unwrap();
         let (b, _) = db.join("r", "bob", "", "", "owner").unwrap();
 
-        db.post(a, "owner", "hi bob", None, "msg", None).unwrap();
+        db.post(a, "owner", "hi bob", None, "msg", None, None).unwrap();
         let got = db.inbox(b, "owner").unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0]["body"], "hi bob");
@@ -1158,7 +1346,7 @@ mod tests {
         let (b, _) = db.join("r", "bob", "", "", "owner").unwrap();
         let (c, _) = db.join("r", "carol", "", "", "owner").unwrap();
 
-        db.post(a, "owner", "for bob only", Some("bob"), "msg", None).unwrap();
+        db.post(a, "owner", "for bob only", Some("bob"), "msg", None, None).unwrap();
         assert_eq!(db.inbox(b, "owner").unwrap().len(), 1);
         assert!(db.inbox(c, "owner").unwrap().is_empty());
         // carol's cursor advanced past the filtered message; nothing re-delivers later
@@ -1170,9 +1358,9 @@ mod tests {
         let db = mem();
         let (a, _) = db.join("r", "alice", "", "", "owner").unwrap();
         let (b, _) = db.join("r", "bob", "", "", "owner").unwrap();
-        db.post(a, "owner", "one", None, "msg", None).unwrap();
+        db.post(a, "owner", "one", None, "msg", None, None).unwrap();
         assert_eq!(db.inbox(b, "owner").unwrap().len(), 1);
-        db.post(a, "owner", "two", None, "msg", None).unwrap();
+        db.post(a, "owner", "two", None, "msg", None, None).unwrap();
 
         // bob rejoins (new session): same id preserved, cursor intact,
         // inbox still delivers only the unseen "two"
@@ -1190,8 +1378,8 @@ mod tests {
         let (a, _) = db.join("r", "alice", "", "", "owner").unwrap();
         let (b, _) = db.join("r", "bob", "", "", "owner").unwrap();
 
-        db.post(a, "owner", "turn 1: refactoring auth", None, "feed", None).unwrap();
-        db.post(a, "owner", "hey bob, need review", None, "msg", None).unwrap();
+        db.post(a, "owner", "turn 1: refactoring auth", None, "feed", None, None).unwrap();
+        db.post(a, "owner", "hey bob, need review", None, "msg", None, None).unwrap();
 
         // inbox delivers only the msg, never feed entries
         let got = db.inbox(b, "owner").unwrap();
@@ -1212,8 +1400,8 @@ mod tests {
         let (a, _) = db.join("r", "alice", "", "", "owner").unwrap();
         let (b, _) = db.join("r", "bob", "", "", "owner").unwrap();
 
-        let (m1, n1) = db.post(a, "owner", "turn text", None, "summary", Some("uuid-1")).unwrap();
-        let (m2, n2) = db.post(a, "owner", "turn text", None, "summary", Some("uuid-1")).unwrap();
+        let (m1, n1) = db.post(a, "owner", "turn text", None, "summary", Some("uuid-1"), None).unwrap();
+        let (m2, n2) = db.post(a, "owner", "turn text", None, "summary", Some("uuid-1"), None).unwrap();
         assert_eq!(m1, m2); assert!(n1); assert!(!n2); // scribe can re-scan transcripts safely
         assert_eq!(db.feed("r", None, 20).unwrap().len(), 1);
         let _ = b;
@@ -1225,8 +1413,8 @@ mod tests {
         let (a, _) = db.join("r", "alice", "", "", "owner").unwrap();
         let (b, _) = db.join("r", "bob", "", "", "owner").unwrap();
 
-        db.post(a, "owner", "urgent", Some("bob"), "blocker", None).unwrap();
-        db.post(a, "owner", "tests green", None, "test_result", None).unwrap();
+        db.post(a, "owner", "urgent", Some("bob"), "blocker", None, None).unwrap();
+        db.post(a, "owner", "tests green", None, "test_result", None, None).unwrap();
 
         // blocker -> inbox; test_result -> feed only
         let got = db.inbox(b, "owner").unwrap();
@@ -1241,11 +1429,11 @@ mod tests {
     fn other_user_cannot_spoof_or_read() {
         let db = mem();
         let (a, _) = db.join("r", "alice", "", "", "gianni").unwrap();
-        db.post(a, "gianni", "private note", None, "msg", None).unwrap();
+        db.post(a, "gianni", "private note", None, "msg", None, None).unwrap();
 
         // friend can't act as alice's agent_id or claim her name
         assert!(matches!(db.inbox(a, "friend"), Err(AgoraErr::Denied)));
-        assert!(matches!(db.post(a, "friend", "spoof", None, "msg", None), Err(AgoraErr::Denied)));
+        assert!(matches!(db.post(a, "friend", "spoof", None, "msg", None, None), Err(AgoraErr::Denied)));
         assert!(matches!(db.set_status(a, "friend", "x"), Err(AgoraErr::Denied)));
         assert!(matches!(db.join("r", "alice", "", "", "friend"), Err(AgoraErr::Denied)));
 
@@ -1261,10 +1449,36 @@ mod tests {
         db.join("r", "pulsar-claude", "", "", "owner").unwrap();
         // the exact bug: DM to "pulsar" when the agent is "pulsar-claude"
         assert!(matches!(
-            db.post(a, "owner", "hi", Some("pulsar"), "msg", None),
+            db.post(a, "owner", "hi", Some("pulsar"), "msg", None, None),
             Err(AgoraErr::NoSuchPeer(_))
         ));
-        assert!(db.post(a, "owner", "hi", Some("pulsar-claude"), "msg", None).is_ok());
+        assert!(db.post(a, "owner", "hi", Some("pulsar-claude"), "msg", None, None).is_ok());
+    }
+
+    #[test]
+    fn reactions_threads_search() {
+        let db = mem();
+        let (a, _) = db.join("r", "alice", "", "", "owner").unwrap();
+        db.join("r", "bob", "", "", "owner").unwrap();
+        let (root, _) = db.post(a, "owner", "deploy the fix?", None, "question", None, None).unwrap();
+        // a threaded reply
+        db.post(a, "owner", "yes, shipping now", None, "msg", None, Some(root)).unwrap();
+        // reaction toggles
+        assert!(db.react(a, "owner", root, "👍").unwrap());        // added
+        assert!(!db.react(a, "owner", root, "👍").unwrap());       // removed (toggle)
+        assert!(db.react(a, "owner", root, "✅").unwrap());        // added different
+
+        // thread = root + reply
+        assert_eq!(db.thread("r", root).unwrap().len(), 2);
+        // search finds the question
+        let hits = db.search("r", "deploy", None, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["body"], "deploy the fix?");
+        // recent_messages carries the surviving ✅ reaction
+        let msgs = db.recent_messages("r", 10).unwrap();
+        let rootmsg = msgs.iter().find(|m| m["id"].as_i64() == Some(root)).unwrap();
+        assert!(rootmsg["reactions"]["✅"].as_array().unwrap().contains(&json!("alice")));
+        assert!(rootmsg["reactions"].get("👍").is_none()); // toggled off
     }
 
     #[test]
