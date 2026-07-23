@@ -1313,6 +1313,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/park", axum::routing::post(http_park))
         .route("/wakeable", axum::routing::get(http_wakeable))
         .route("/", axum::routing::get(dashboard))
+        .route("/dashboard", axum::routing::get(dashboard))
         .with_state(db_state)
         .nest_service("/mcp", service);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
